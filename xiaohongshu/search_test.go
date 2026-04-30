@@ -4,6 +4,7 @@ import (
 	"context"
 	stderrors "errors"
 	"fmt"
+	"os"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -37,9 +38,13 @@ func TestSearch(t *testing.T) {
 	}
 }
 
+// TestSearchWithFilters 需要真实浏览器 + 登录态，默认跳过。
+// 本地手工验证：XHS_E2E=1 go test ./xiaohongshu -run TestSearchWithFilters -v
 func TestSearchWithFilters(t *testing.T) {
 
-	//t.Skip("SKIP: 测试筛选功能")
+	if os.Getenv("XHS_E2E") == "" {
+		t.Skip("SKIP: 需要真实浏览器+登录态，设置 XHS_E2E=1 启用")
+	}
 
 	b := browser.NewBrowser(false)
 	defer b.Close()
