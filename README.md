@@ -871,6 +871,22 @@ npx mcporter list xiaohongshu-mcp
     - `publish_time`: 发布时间 - `不限`（默认）| `一天内` | `一周内` | `半年内`
     - `search_scope`: 搜索范围 - `不限`（默认）| `已看过` | `未看过` | `已关注`
     - `location`: 位置距离 - `不限`（默认）| `同城` | `附近`
+  - 筛选行为说明：当传入 `filters` 时，会通过原生筛选 UI 操作。点击筛选选项后会进入条件竞争，命中以下任一条件就立即结束（最长 25 秒）：
+    - feed 列表指纹变化 → 成功，返回筛选后的 feeds
+    - 出现登录弹窗 → 返回 `login_required`
+    - 出现安全验证 / 验证码 → 返回 `captcha_or_security_check`
+    - feed 列表为空 → 返回 `empty_result`
+    - 找不到筛选按钮 / 面板 / 选项 → 返回 `selector_not_found`
+    - 25 秒内 feed 未变化 → 返回 `filter_timeout`
+
+    错误信息走 `errors` 包里的 sentinel，可用 `errors.Is(err, errors.ErrFilterTimeout)` 等判断。
+
+  - 手工诊断脚本：
+    ```bash
+    # 必须先用 cmd/login 完成登录，cookies 保存到本地后再运行
+    go run ./cmd/diagnose-search-filter -keyword=美食 -sort_by=最多点赞 -headless=false
+    ```
+    脚本会打印总耗时和最多 5 条结果；失败时会打印 `error_code: <错误码>`。
 - `get_feed_detail` - 获取帖子详情，包括互动数据和评论（必需：feed_id, xsec_token）
   - `load_all_comments`: 是否加载全部评论（可选），默认 false 仅返回前 10 条一级评论
   - `limit`: 限制加载的一级评论数量（可选），仅当 load_all_comments=true 时生效，默认 20
