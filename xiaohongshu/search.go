@@ -3,11 +3,15 @@ package xiaohongshu
 import (
 	"context"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/go-rod/rod"
+	"github.com/go-rod/rod/lib/proto"
+	"github.com/sirupsen/logrus"
 	"github.com/xpzouying/xiaohongshu-mcp/errors"
 )
 
@@ -26,132 +30,68 @@ type FilterOption struct {
 	Location    string `json:"location,omitempty" jsonschema:"位置距离: 不限|同城|附近,默认为'不限'"`
 }
 
-// internalFilterOption 内部使用的筛选选项(基于索引)
+// internalFilterOption 内部使用的筛选选项（按文本定位，避免脆弱的 nth-child）
 type internalFilterOption struct {
-	FiltersIndex int    // 筛选组索引
-	TagsIndex    int    // 标签索引
-	Text         string // 标签文本描述
+	GroupLabel string // 筛选组标签，如 "排序依据"
+	OptionText string // 选项文本，如 "最多点赞"
 }
 
-// 预定义的筛选选项映射表（内部使用）
-var filterOptionsMap = map[int][]internalFilterOption{
-	1: { // 排序依据
-		{FiltersIndex: 1, TagsIndex: 1, Text: "综合"},
-		{FiltersIndex: 1, TagsIndex: 2, Text: "最新"},
-		{FiltersIndex: 1, TagsIndex: 3, Text: "最多点赞"},
-		{FiltersIndex: 1, TagsIndex: 4, Text: "最多评论"},
-		{FiltersIndex: 1, TagsIndex: 5, Text: "最多收藏"},
-	},
-	2: { // 笔记类型
-		{FiltersIndex: 2, TagsIndex: 1, Text: "不限"},
-		{FiltersIndex: 2, TagsIndex: 2, Text: "视频"},
-		{FiltersIndex: 2, TagsIndex: 3, Text: "图文"},
-	},
-	3: { // 发布时间
-		{FiltersIndex: 3, TagsIndex: 1, Text: "不限"},
-		{FiltersIndex: 3, TagsIndex: 2, Text: "一天内"},
-		{FiltersIndex: 3, TagsIndex: 3, Text: "一周内"},
-		{FiltersIndex: 3, TagsIndex: 4, Text: "半年内"},
-	},
-	4: { // 搜索范围
-		{FiltersIndex: 4, TagsIndex: 1, Text: "不限"},
-		{FiltersIndex: 4, TagsIndex: 2, Text: "已看过"},
-		{FiltersIndex: 4, TagsIndex: 3, Text: "未看过"},
-		{FiltersIndex: 4, TagsIndex: 4, Text: "已关注"},
-	},
-	5: { // 位置距离
-		{FiltersIndex: 5, TagsIndex: 1, Text: "不限"},
-		{FiltersIndex: 5, TagsIndex: 2, Text: "同城"},
-		{FiltersIndex: 5, TagsIndex: 3, Text: "附近"},
-	},
+// 筛选组标签 -> 合法选项集合。仅用于离线校验，不参与 DOM 查询索引。
+var filterOptionsMap = map[string][]string{
+	"排序依据": {"综合", "最新", "最多点赞", "最多评论", "最多收藏"},
+	"笔记类型": {"不限", "视频", "图文"},
+	"发布时间": {"不限", "一天内", "一周内", "半年内"},
+	"搜索范围": {"不限", "已看过", "未看过", "已关注"},
+	"位置距离": {"不限", "同城", "附近"},
 }
 
 // convertToInternalFilters 将 FilterOption 转换为内部的 internalFilterOption 列表
 func convertToInternalFilters(filter FilterOption) ([]internalFilterOption, error) {
-	var internalFilters []internalFilterOption
-
-	// 处理排序依据
-	if filter.SortBy != "" {
-		internal, err := findInternalOption(1, filter.SortBy)
-		if err != nil {
-			return nil, fmt.Errorf("排序依据错误: %w", err)
-		}
-		internalFilters = append(internalFilters, internal)
+	pairs := []struct {
+		groupLabel string
+		text       string
+	}{
+		{"排序依据", filter.SortBy},
+		{"笔记类型", filter.NoteType},
+		{"发布时间", filter.PublishTime},
+		{"搜索范围", filter.SearchScope},
+		{"位置距离", filter.Location},
 	}
 
-	// 处理笔记类型
-	if filter.NoteType != "" {
-		internal, err := findInternalOption(2, filter.NoteType)
-		if err != nil {
-			return nil, fmt.Errorf("笔记类型错误: %w", err)
+	var out []internalFilterOption
+	for _, p := range pairs {
+		if p.text == "" {
+			continue
 		}
-		internalFilters = append(internalFilters, internal)
-	}
-
-	// 处理发布时间
-	if filter.PublishTime != "" {
-		internal, err := findInternalOption(3, filter.PublishTime)
-		if err != nil {
-			return nil, fmt.Errorf("发布时间错误: %w", err)
+		if !isValidOption(p.groupLabel, p.text) {
+			return nil, fmt.Errorf("筛选组 %q 中未找到文本 '%s'", p.groupLabel, p.text)
 		}
-		internalFilters = append(internalFilters, internal)
+		out = append(out, internalFilterOption{GroupLabel: p.groupLabel, OptionText: p.text})
 	}
-
-	// 处理搜索范围
-	if filter.SearchScope != "" {
-		internal, err := findInternalOption(4, filter.SearchScope)
-		if err != nil {
-			return nil, fmt.Errorf("搜索范围错误: %w", err)
-		}
-		internalFilters = append(internalFilters, internal)
-	}
-
-	// 处理位置距离
-	if filter.Location != "" {
-		internal, err := findInternalOption(5, filter.Location)
-		if err != nil {
-			return nil, fmt.Errorf("位置距离错误: %w", err)
-		}
-		internalFilters = append(internalFilters, internal)
-	}
-
-	return internalFilters, nil
+	return out, nil
 }
 
-// findInternalOption 根据筛选组索引和文本查找内部筛选选项
-func findInternalOption(filtersIndex int, text string) (internalFilterOption, error) {
-	options, exists := filterOptionsMap[filtersIndex]
-	if !exists {
-		return internalFilterOption{}, fmt.Errorf("筛选组 %d 不存在", filtersIndex)
+func isValidOption(groupLabel, text string) bool {
+	options, ok := filterOptionsMap[groupLabel]
+	if !ok {
+		return false
 	}
-
-	for _, option := range options {
-		if option.Text == text {
-			return option, nil
+	for _, opt := range options {
+		if opt == text {
+			return true
 		}
 	}
-
-	return internalFilterOption{}, fmt.Errorf("在筛选组 %d 中未找到文本 '%s'", filtersIndex, text)
+	return false
 }
 
-// validateInternalFilterOption 验证内部筛选选项是否在有效范围内
+// validateInternalFilterOption 验证内部筛选选项是否有效
 func validateInternalFilterOption(filter internalFilterOption) error {
-	// 检查筛选组索引是否有效
-	if filter.FiltersIndex < 1 || filter.FiltersIndex > 5 {
-		return fmt.Errorf("无效的筛选组索引 %d，有效范围为 1-5", filter.FiltersIndex)
+	if filter.GroupLabel == "" || filter.OptionText == "" {
+		return fmt.Errorf("筛选选项不能为空: %+v", filter)
 	}
-
-	// 检查标签索引是否在对应筛选组的有效范围内
-	options, exists := filterOptionsMap[filter.FiltersIndex]
-	if !exists {
-		return fmt.Errorf("筛选组 %d 不存在", filter.FiltersIndex)
+	if !isValidOption(filter.GroupLabel, filter.OptionText) {
+		return fmt.Errorf("筛选组 %q 中不存在选项 %q", filter.GroupLabel, filter.OptionText)
 	}
-
-	if filter.TagsIndex < 1 || filter.TagsIndex > len(options) {
-		return fmt.Errorf("筛选组 %d 的标签索引 %d 超出范围，有效范围为 1-%d",
-			filter.FiltersIndex, filter.TagsIndex, len(options))
-	}
-
 	return nil
 }
 
@@ -161,9 +101,29 @@ type SearchAction struct {
 
 func NewSearchAction(page *rod.Page) *SearchAction {
 	pp := page.Timeout(60 * time.Second)
-
 	return &SearchAction{page: pp}
 }
+
+const (
+	// 单步 selector 查找的短超时（找不到立即失败，避免无限等）。
+	filterUITimeout = 5 * time.Second
+	// 单次点击预算（包含 ScrollIntoView + WaitInteractable + Hover + Click）。
+	// 比 filterUITimeout 长，给出足够时间让面板/选项渲染稳定。
+	filterClickTimeout = 10 * time.Second
+	// WaitInteractable 单独留 3s 预算；如果元素一直被遮挡 / 动画中，
+	// 不要把整个 click 预算都耗在等"在最上层"上。
+	filterClickWaitInteractable = 3 * time.Second
+	// 一次具体动作（Click 或 Eval）的预算；和 WaitInteractable 分开，
+	// 避免上一步把父 context 烧光。
+	filterClickAction = 5 * time.Second
+	// 面板打开 / hover 后等待动画 (fade-in/slide) 稳定的小延迟。
+	// 没有它，rod 的 WaitInteractable "is on top" 检查会在动画期间误判。
+	filterPanelSettleDelay = 400 * time.Millisecond
+	// 整个筛选生效的总预算，issue 要求 15-30s 内必须给出结论。
+	filterApplyTimeout = 25 * time.Second
+	// 筛选生效轮询间隔。
+	filterPollInterval = 250 * time.Millisecond
+)
 
 func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...FilterOption) ([]Feed, error) {
 	page := s.page.Context(ctx)
@@ -174,9 +134,8 @@ func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...Fi
 
 	page.MustWait(`() => window.__INITIAL_STATE__ !== undefined`)
 
-	// 如果有筛选条件，则应用筛选
 	if len(filters) > 0 {
-		// 将所有 FilterOption 转换为内部筛选选项
+		// 转换并校验所有筛选选项
 		var allInternalFilters []internalFilterOption
 		for _, filter := range filters {
 			internalFilters, err := convertToInternalFilters(filter)
@@ -185,35 +144,319 @@ func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...Fi
 			}
 			allInternalFilters = append(allInternalFilters, internalFilters...)
 		}
-
-		// 验证所有内部筛选选项
 		for _, filter := range allInternalFilters {
 			if err := validateInternalFilterOption(filter); err != nil {
 				return nil, fmt.Errorf("筛选选项验证失败: %w", err)
 			}
 		}
 
-		// 悬停在筛选按钮上
-		filterButton := page.MustElement(`div.filter`)
-		filterButton.MustHover()
-
-		// 等待筛选面板出现
-		page.MustWait(`() => document.querySelector('div.filter-panel') !== null`)
-
-		// 应用所有筛选条件
-		for _, filter := range allInternalFilters {
-			selector := fmt.Sprintf(`div.filter-panel div.filters:nth-child(%d) div.tags:nth-child(%d)`,
-				filter.FiltersIndex, filter.TagsIndex)
-			option := page.MustElement(selector)
-			option.MustClick()
+		if len(allInternalFilters) > 0 {
+			if err := s.applyFilters(ctx, allInternalFilters); err != nil {
+				return nil, err
+			}
 		}
-
-		// 等待页面更新
-		page.MustWaitStable()
-		// 重新等待 __INITIAL_STATE__ 更新
-		page.MustWait(`() => window.__INITIAL_STATE__ !== undefined`)
 	}
 
+	return extractFeedsFromPage(page)
+}
+
+// applyFilters 通过原生筛选 UI 应用筛选条件。
+//
+// 与原实现的差异：
+//  1. selector 全部按文本定位，不再依赖 nth-child；
+//  2. 不再使用无界的 MustWaitStable；
+//  3. 每次点击前重新 Hover 筛选按钮，并重新查询面板/选项，避免面板收起或句柄过期；
+//  4. 关键：discovery 用 5s 短超时，但 element 句柄重新绑回 page 的长 context，
+//     避免 click / eval 共用了 discovery 已经耗尽的 5s 预算；
+//  5. 点击完最后一个选项后进入条件竞争，命中以下任一条件就立即返回：
+//     - feed 列表指纹变化
+//     - 出现登录弹窗
+//     - 出现安全验证 / 验证码
+//     - 检测到空结果
+//     - selector 找不到
+//     - 点击不可交互 / 失败
+//     - 达到 filterApplyTimeout 总预算
+func (s *SearchAction) applyFilters(ctx context.Context, filters []internalFilterOption) error {
+	page := s.page.Context(ctx)
+
+	// 1. 点击前先快照当前 feed，用于检测筛选生效
+	initial := captureSearchSnapshot(page)
+
+	// 2. 短超时找筛选按钮，但句柄绑回 page 的长 context
+	filterBtn, err := findElementShort(page, `div.filter`, filterUITimeout)
+	if err != nil {
+		return fmt.Errorf("%w: 找不到筛选按钮 div.filter: %v", errors.ErrSelectorNotFound, err)
+	}
+
+	// 3. 打开筛选面板（hover 优先，hover 不出来时回退到 click）
+	if err := openFilterPanel(page, filterBtn); err != nil {
+		return err
+	}
+
+	// 4. 依次点击每个筛选选项；每次都重新 hover + 重新查 panel/row/tag，避免句柄过期
+	for _, f := range filters {
+		if err := filterBtn.Hover(); err != nil {
+			return fmt.Errorf("%w: 重新悬停筛选按钮失败: %v", errors.ErrSelectorNotFound, err)
+		}
+		panel, err := findElementShort(page, `div.filter-panel`, filterUITimeout)
+		if err != nil {
+			return fmt.Errorf("%w: 找不到筛选面板 div.filter-panel: %v", errors.ErrSelectorNotFound, err)
+		}
+		if err := clickFilterOption(page, panel, f.GroupLabel, f.OptionText); err != nil {
+			return err
+		}
+	}
+
+	// 5. 把鼠标移开筛选区，让 hover 触发的面板收起，触发"提交"。
+	// 部分 UI 选项是 hover-保持+click 模型，关掉面板才会真正 apply。
+	closeFilterPanel(page)
+
+	// 6. 条件竞争：等待筛选生效或快速失败
+	return waitForFilterApplied(ctx, page, initial)
+}
+
+// closeFilterPanel 把鼠标移到 (0,0)，关掉 hover 触发的筛选面板。
+// 用于触发 "click 选项后还要关面板才提交" 的 UI。失败不算错。
+func closeFilterPanel(page *rod.Page) {
+	if err := page.Mouse.MoveTo(proto.Point{X: 0, Y: 0}); err != nil {
+		logrus.WithError(err).Debug("move mouse to (0,0) failed; ignored")
+	}
+}
+
+// findElementShort 用短超时做 selector 存在性检查，但把返回的 element 句柄
+// 绑回 page 的长 context。这样后续的 Click / Eval / WaitInteractable 不会
+// 因为 discovery 的短 context 已经耗尽就立刻 deadline exceeded。
+func findElementShort(page *rod.Page, selector string, timeout time.Duration) (*rod.Element, error) {
+	el, err := page.Timeout(timeout).Element(selector)
+	if err != nil {
+		return nil, err
+	}
+	return el.Context(page.GetContext()), nil
+}
+
+// openFilterPanel 把筛选面板打开。先尝试 hover（XHS 主流交互），不行就 click 兜底。
+func openFilterPanel(page *rod.Page, filterBtn *rod.Element) error {
+	if err := filterBtn.Hover(); err != nil {
+		return fmt.Errorf("%w: 悬停筛选按钮失败: %v", errors.ErrSelectorNotFound, err)
+	}
+	if _, err := findElementShort(page, `div.filter-panel`, filterUITimeout); err == nil {
+		// 面板出现后再等一小段动画时间，避免 fade-in 期间 WaitInteractable 误判
+		time.Sleep(filterPanelSettleDelay)
+		return nil
+	}
+	// hover 没出面板，尝试 click 兜底
+	if err := filterBtn.Click(proto.InputMouseButtonLeft, 1); err != nil {
+		return fmt.Errorf("%w: 悬停未打开面板，点击筛选按钮也失败: %v", errors.ErrFilterClickFailed, err)
+	}
+	if _, err := findElementShort(page, `div.filter-panel`, filterUITimeout); err != nil {
+		return fmt.Errorf("%w: 点击筛选按钮后仍找不到面板 div.filter-panel: %v", errors.ErrSelectorNotFound, err)
+	}
+	time.Sleep(filterPanelSettleDelay)
+	return nil
+}
+
+// clickFilterOption 在筛选面板内按文本定位筛选行 + 选项并点击。
+func clickFilterOption(page *rod.Page, panel *rod.Element, groupLabel, optionText string) error {
+	rows, err := panel.Elements(`div.filters`)
+	if err != nil || len(rows) == 0 {
+		return fmt.Errorf("%w: 筛选面板内没有筛选行 div.filters: %v", errors.ErrSelectorNotFound, err)
+	}
+
+	for _, row := range rows {
+		text, _ := row.Text()
+		if !strings.Contains(text, groupLabel) {
+			continue
+		}
+		tags, err := row.Elements(`div.tags`)
+		if err != nil || len(tags) == 0 {
+			return fmt.Errorf("%w: 筛选组 %q 内没有选项 div.tags: %v", errors.ErrSelectorNotFound, groupLabel, err)
+		}
+		for _, tag := range tags {
+			t, _ := tag.Text()
+			if strings.TrimSpace(t) != optionText {
+				continue
+			}
+			// 句柄重新绑回 page 的长 context，避免继承 discovery 的短超时
+			tag = tag.Context(page.GetContext())
+			return clickInteractable(tag, groupLabel, optionText)
+		}
+		return fmt.Errorf("%w: 筛选组 %q 中未找到选项 %q", errors.ErrSelectorNotFound, groupLabel, optionText)
+	}
+	return fmt.Errorf("%w: 未找到筛选组 %q", errors.ErrSelectorNotFound, groupLabel)
+}
+
+// clickInteractable 用三层策略点击筛选选项。
+//
+// 策略：
+//  1. 优先用 go-rod 真实鼠标点击（ScrollIntoView + WaitInteractable + Click），
+//     这是 CLAUDE.md 推荐的路径。WaitInteractable 限定 3s，避免吃光全部预算。
+//  2. WaitInteractable / Click 失败时，用一段 JS dispatchEvent('click', bubbles)
+//     兜底。绕开 z-index/overlay/动画判定。
+//  3. 全部失败时，再做一次诊断 JS 输出 bbox / 可见性 / elementFromPoint，
+//     方便定位 DOM 实际响应的容器。
+//
+// 关键：每个步骤都重新 .Context(page) / .Timeout() 派生独立预算，避免上一步
+// 把整个父 context 烧光。
+func clickInteractable(el *rod.Element, groupLabel, optionText string) error {
+	// 滚到视野内
+	_ = el.ScrollIntoView()
+
+	// 1. 优先 go-rod 真实鼠标点击：WaitInteractable 限定 3s，避免吃光预算
+	waitEl := el.Timeout(filterClickWaitInteractable)
+	if _, werr := waitEl.WaitInteractable(); werr != nil {
+		logrus.WithFields(logrus.Fields{
+			"group": groupLabel, "option": optionText, "err": werr,
+		}).Debug("WaitInteractable failed, fallback to JS click")
+	} else {
+		// Click 用一个独立的 5s 预算
+		clickEl := el.Timeout(filterClickAction)
+		if cerr := clickEl.Click(proto.InputMouseButtonLeft, 1); cerr == nil {
+			return nil
+		} else {
+			logrus.WithFields(logrus.Fields{
+				"group": groupLabel, "option": optionText, "err": cerr,
+			}).Debug("rod click failed, fallback to JS click")
+		}
+	}
+
+	// 2. JS click 兜底：派发可冒泡的 MouseEvent，更接近真实点击
+	jsEl := el.Timeout(filterClickAction)
+	if _, err := jsEl.Eval(jsClickScript); err != nil {
+		// 3. 诊断：rod + JS 都失败时，输出 DOM 现场，方便后续排查
+		logClickDiagnostics(el, groupLabel, optionText)
+		return fmt.Errorf("%w: 选项 %q/%q rod+JS 都点不动: %v", errors.ErrFilterClickFailed, groupLabel, optionText, err)
+	}
+	return nil
+}
+
+// jsClickScript 派发一个可冒泡的 click MouseEvent，并把 mousedown / mouseup
+// 顺序也补上。比直接 this.click() 更接近真实鼠标点击，能触发事件委托。
+const jsClickScript = `() => {
+	const r = this.getBoundingClientRect();
+	const x = r.left + r.width / 2;
+	const y = r.top + r.height / 2;
+	const opts = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, button: 0 };
+	this.dispatchEvent(new MouseEvent('mousedown', opts));
+	this.dispatchEvent(new MouseEvent('mouseup', opts));
+	this.dispatchEvent(new MouseEvent('click', opts));
+	return { x, y };
+}`
+
+// logClickDiagnostics 在 rod + JS 都失败时输出诊断信息：
+// bbox / computed style / elementFromPoint / 是否在 viewport 内。
+// JS 内部 JSON.stringify，避免 gson.JSON.Str() 对 object 返回空。
+func logClickDiagnostics(el *rod.Element, groupLabel, optionText string) {
+	res, err := el.Timeout(2 * time.Second).Eval(`() => {
+		const r = this.getBoundingClientRect();
+		const x = r.left + r.width / 2;
+		const y = r.top + r.height / 2;
+		const cs = window.getComputedStyle(this);
+		const top = document.elementFromPoint(x, y);
+		const topInfo = top ? {
+			tag: top.tagName,
+			cls: top.className,
+			text: (top.textContent || '').slice(0, 40),
+			isSelf: top === this,
+			isDescendant: this.contains(top),
+			isAncestor: top.contains(this),
+		} : null;
+		return JSON.stringify({
+			bbox: { x: r.x, y: r.y, w: r.width, h: r.height },
+			center: { x, y },
+			inViewport: r.bottom > 0 && r.right > 0 && r.top < innerHeight && r.left < innerWidth,
+			style: {
+				display: cs.display,
+				visibility: cs.visibility,
+				pointerEvents: cs.pointerEvents,
+				zIndex: cs.zIndex,
+				opacity: cs.opacity,
+			},
+			elementFromPoint: topInfo,
+			html: (this.outerHTML || '').slice(0, 200),
+		});
+	}`)
+	if err != nil {
+		logrus.WithFields(logrus.Fields{"group": groupLabel, "option": optionText, "err": err}).
+			Warn("filter click diagnostics eval failed")
+		return
+	}
+	logrus.WithFields(logrus.Fields{
+		"group":  groupLabel,
+		"option": optionText,
+		"info":   res.Value.Str(),
+	}).Warn("filter click failed; diagnostics dumped (用以排查 onClick 是否绑在 div.tags 上)")
+}
+
+// waitForFilterApplied 在 filterApplyTimeout 内做条件竞争。
+func waitForFilterApplied(ctx context.Context, page *rod.Page, initial searchSnapshot) error {
+	deadline := time.Now().Add(filterApplyTimeout)
+	ticker := time.NewTicker(filterPollInterval)
+	defer ticker.Stop()
+
+	for {
+		// 登录弹窗：扫码登录组件出现
+		if pageHas(page, `.login-container .qrcode-img`) {
+			return errors.ErrLoginRequired
+		}
+		// 安全验证 / 验证码：常见 iframe 或带 captcha 的容器
+		if pageHas(page, `iframe[src*="captcha"], iframe[id*="captcha"], div[class*="captcha"]`) {
+			return errors.ErrCaptchaOrSecurity
+		}
+
+		cur := captureSearchSnapshot(page)
+		switch cur.State {
+		case stateEmpty:
+			return errors.ErrEmptyResult
+		case stateFeeds:
+			if filterChanged(initial, cur) {
+				return nil
+			}
+		}
+
+		if time.Now().After(deadline) {
+			logrus.WithFields(logrus.Fields{
+				"initial_fp":      initial.Fingerprint,
+				"current_fp":      cur.Fingerprint,
+				"initial_url":     initial.URLSearch,
+				"current_url":     cur.URLSearch,
+				"initial_active":  initial.ActiveFilters,
+				"current_active":  cur.ActiveFilters,
+				"state":           cur.State,
+				"feeds_len_match": cur.Fingerprint != "" && cur.Fingerprint == initial.Fingerprint,
+			}).Warn("search filter apply timed out (no signal changed)")
+			return errors.ErrFilterTimeout
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+// pageHas 是 page.Has 的安全封装，错误吞掉视为不存在。
+func pageHas(page *rod.Page, selector string) bool {
+	has, _, _ := page.Has(selector)
+	return has
+}
+
+// filterChanged 用多信号 OR 判断筛选是否生效。任意一个维度变化都算。
+func filterChanged(initial, cur searchSnapshot) bool {
+	if cur.Fingerprint != "" && cur.Fingerprint != initial.Fingerprint {
+		return true
+	}
+	if cur.URLSearch != "" && cur.URLSearch != initial.URLSearch {
+		return true
+	}
+	if cur.ActiveFilters != initial.ActiveFilters {
+		return true
+	}
+	return false
+}
+
+// extractFeedsFromPage 读取 __INITIAL_STATE__ 中的 feeds 列表。
+func extractFeedsFromPage(page *rod.Page) ([]Feed, error) {
 	result := page.MustEval(`() => {
 		if (window.__INITIAL_STATE__ &&
 		    window.__INITIAL_STATE__.search &&
@@ -235,8 +478,106 @@ func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...Fi
 	if err := json.Unmarshal([]byte(result), &feeds); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal feeds: %w", err)
 	}
-
 	return feeds, nil
+}
+
+// searchSnapshot 表示某一时刻搜索页的多维度指纹。
+//
+// 单一来源（top-3 feed id）不够：实测发现"最多点赞"筛选时，22 条 feed 的
+// 顺序变了，但前两条恰好是默认排序也排在前面的高赞 note，top-3 fingerprint
+// 没明显变化，会误判筛选未生效。
+//
+// 现在多信号 OR：
+//   - Fingerprint: __INITIAL_STATE__.search.feeds 的 length + 全部 id 拼接
+//   - URLSearch: location.search（XHS 部分版本会把 sort= 写进 query）
+//   - ActiveFilters: 当前面板里 .active/.selected 标签的文本
+//
+// 任何一个变化都视为筛选生效。
+type searchSnapshot struct {
+	State         string `json:"state"`         // stateFeeds / stateEmpty / stateUnknown
+	Fingerprint   string `json:"fingerprint"`   // length:id1,id2,...,idN
+	URLSearch     string `json:"urlSearch"`     // location.search
+	ActiveFilters string `json:"activeFilters"` // joined active/selected tag texts
+}
+
+const (
+	stateFeeds   = "feeds"
+	stateEmpty   = "empty"
+	stateUnknown = "unknown"
+)
+
+// captureSnapshotJS 在浏览器内运行的快照脚本。挑这点 JS 是因为 __INITIAL_STATE__
+// 是页面级 JS 全局变量，无法直接通过 go-rod 的 DOM 查询拿到；URL / DOM 查询则
+// 顺手一起做掉，避免多次 RPC。
+const captureSnapshotJS = `() => {
+	const out = { state: 'unknown', fingerprint: '', urlSearch: '', activeFilters: '' };
+	out.urlSearch = location.search || '';
+
+	// 当前面板里 active/selected 的筛选项文本
+	const activeNodes = document.querySelectorAll(
+		'div.filter-panel .active, div.filter-panel .selected, ' +
+			'div.filter-panel [class*="active"], div.filter-panel [class*="selected"]'
+	);
+	const activeTexts = [];
+	activeNodes.forEach(n => {
+		const t = (n.textContent || '').trim();
+		if (t) activeTexts.push(t);
+	});
+	out.activeFilters = activeTexts.join('|');
+
+	if (window.__INITIAL_STATE__ &&
+	    window.__INITIAL_STATE__.search &&
+	    window.__INITIAL_STATE__.search.feeds) {
+		const feeds = window.__INITIAL_STATE__.search.feeds;
+		const data = feeds.value !== undefined ? feeds.value : feeds._value;
+		if (Array.isArray(data)) {
+			if (data.length === 0) {
+				out.state = 'empty';
+			} else {
+				out.state = 'feeds';
+				// 全量 id（不再只取 top-3），任何顺序变化都能识别
+				const ids = data.map(f => (f && f.id) || '');
+				out.fingerprint = data.length + ':' + ids.join(',');
+			}
+		}
+	}
+	return JSON.stringify(out);
+}`
+
+func captureSearchSnapshot(page *rod.Page) searchSnapshot {
+	val, err := page.Eval(captureSnapshotJS)
+	if err != nil || val == nil {
+		return searchSnapshot{State: stateUnknown}
+	}
+	return parseSearchSnapshot(val.Value.String())
+}
+
+func parseSearchSnapshot(raw string) searchSnapshot {
+	if raw == "" {
+		return searchSnapshot{State: stateUnknown}
+	}
+	var snap searchSnapshot
+	if err := json.Unmarshal([]byte(raw), &snap); err != nil {
+		return searchSnapshot{State: stateUnknown}
+	}
+	if snap.State == "" {
+		snap.State = stateUnknown
+	}
+	return snap
+}
+
+// IsFilterError 帮助 wrapper / 调用方判断错误是否属于筛选快速失败错误族。
+func IsFilterError(err error) bool {
+	switch {
+	case stderrors.Is(err, errors.ErrFilterTimeout),
+		stderrors.Is(err, errors.ErrLoginRequired),
+		stderrors.Is(err, errors.ErrCaptchaOrSecurity),
+		stderrors.Is(err, errors.ErrEmptyResult),
+		stderrors.Is(err, errors.ErrSelectorNotFound),
+		stderrors.Is(err, errors.ErrFilterClickFailed):
+		return true
+	}
+	return false
 }
 
 func makeSearchURL(keyword string) string {
