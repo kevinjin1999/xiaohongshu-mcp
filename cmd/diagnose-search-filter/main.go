@@ -102,6 +102,8 @@ func errorCode(err error) string {
 		return "empty_result"
 	case stderrors.Is(err, errors.ErrSelectorNotFound):
 		return "selector_not_found"
+	case stderrors.Is(err, errors.ErrFilterClickFailed):
+		return "filter_click_failed"
 	case stderrors.Is(err, errors.ErrNoFeeds):
 		return "no_feeds"
 	default:

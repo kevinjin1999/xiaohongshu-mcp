@@ -105,8 +105,11 @@ func NewSearchAction(page *rod.Page) *SearchAction {
 }
 
 const (
-	// 单步 UI 操作（点击筛选按钮 / 等待面板出现 / 点击某个选项）的短超时。
+	// 单步 selector 查找的短超时（找不到立即失败，避免无限等）。
 	filterUITimeout = 5 * time.Second
+	// 单次点击预算（包含 ScrollIntoView + WaitInteractable + Hover + Click）。
+	// 比 filterUITimeout 长，给出足够时间让面板/选项渲染稳定。
+	filterClickTimeout = 10 * time.Second
 	// 整个筛选生效的总预算，issue 要求 15-30s 内必须给出结论。
 	filterApplyTimeout = 25 * time.Second
 	// 筛选生效轮询间隔。
@@ -153,12 +156,14 @@ func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...Fi
 // 与原实现的差异：
 //  1. selector 全部按文本定位，不再依赖 nth-child；
 //  2. 不再使用无界的 MustWaitStable；
-//  3. 点击完最后一个选项后进入条件竞争，命中以下任一条件就立即返回：
+//  3. 每次点击前重新 Hover 筛选按钮，并重新查询面板/选项，避免面板收起或句柄过期；
+//  4. 点击完最后一个选项后进入条件竞争，命中以下任一条件就立即返回：
 //     - feed 列表指纹变化
 //     - 出现登录弹窗
 //     - 出现安全验证 / 验证码
 //     - 检测到空结果
 //     - selector 找不到
+//     - 点击不可交互 / 失败
 //     - 达到 filterApplyTimeout 总预算
 func (s *SearchAction) applyFilters(ctx context.Context, filters []internalFilterOption) error {
 	page := s.page.Context(ctx)
@@ -166,23 +171,26 @@ func (s *SearchAction) applyFilters(ctx context.Context, filters []internalFilte
 	// 1. 点击前先快照当前 feed，用于检测筛选生效
 	initial := captureSearchSnapshot(page)
 
-	// 2. 短超时悬停筛选按钮
+	// 2. 短超时找筛选按钮
 	filterBtn, err := page.Timeout(filterUITimeout).Element(`div.filter`)
 	if err != nil {
 		return fmt.Errorf("%w: 找不到筛选按钮 div.filter: %v", errors.ErrSelectorNotFound, err)
 	}
-	if err := filterBtn.Hover(); err != nil {
-		return fmt.Errorf("%w: 悬停筛选按钮失败: %v", errors.ErrSelectorNotFound, err)
+
+	// 3. 打开筛选面板（hover 优先，hover 不出来时回退到 click）
+	if err := openFilterPanel(page, filterBtn); err != nil {
+		return err
 	}
 
-	// 3. 短超时等待筛选面板出现
-	panel, err := page.Timeout(filterUITimeout).Element(`div.filter-panel`)
-	if err != nil {
-		return fmt.Errorf("%w: 找不到筛选面板 div.filter-panel: %v", errors.ErrSelectorNotFound, err)
-	}
-
-	// 4. 按文本依次点击每个筛选选项
+	// 4. 依次点击每个筛选选项；每次都重新 hover + 重新查 panel/row/tag，避免句柄过期
 	for _, f := range filters {
+		if err := filterBtn.Hover(); err != nil {
+			return fmt.Errorf("%w: 重新悬停筛选按钮失败: %v", errors.ErrSelectorNotFound, err)
+		}
+		panel, err := page.Timeout(filterUITimeout).Element(`div.filter-panel`)
+		if err != nil {
+			return fmt.Errorf("%w: 找不到筛选面板 div.filter-panel: %v", errors.ErrSelectorNotFound, err)
+		}
 		if err := clickFilterOption(panel, f.GroupLabel, f.OptionText); err != nil {
 			return err
 		}
@@ -190,6 +198,24 @@ func (s *SearchAction) applyFilters(ctx context.Context, filters []internalFilte
 
 	// 5. 条件竞争：等待筛选生效或快速失败
 	return waitForFilterApplied(ctx, page, initial)
+}
+
+// openFilterPanel 把筛选面板打开。先尝试 hover（XHS 主流交互），不行就 click 兜底。
+func openFilterPanel(page *rod.Page, filterBtn *rod.Element) error {
+	if err := filterBtn.Hover(); err != nil {
+		return fmt.Errorf("%w: 悬停筛选按钮失败: %v", errors.ErrSelectorNotFound, err)
+	}
+	if _, err := page.Timeout(filterUITimeout).Element(`div.filter-panel`); err == nil {
+		return nil
+	}
+	// hover 没出面板，尝试 click 兜底
+	if err := filterBtn.Timeout(filterClickTimeout).Click(proto.InputMouseButtonLeft, 1); err != nil {
+		return fmt.Errorf("%w: 悬停未打开面板，点击筛选按钮也失败: %v", errors.ErrFilterClickFailed, err)
+	}
+	if _, err := page.Timeout(filterUITimeout).Element(`div.filter-panel`); err != nil {
+		return fmt.Errorf("%w: 点击筛选按钮后仍找不到面板 div.filter-panel: %v", errors.ErrSelectorNotFound, err)
+	}
+	return nil
 }
 
 // clickFilterOption 在筛选面板内按文本定位筛选行 + 选项并点击。
@@ -213,14 +239,27 @@ func clickFilterOption(panel *rod.Element, groupLabel, optionText string) error 
 			if strings.TrimSpace(t) != optionText {
 				continue
 			}
-			if err := tag.Click(proto.InputMouseButtonLeft, 1); err != nil {
-				return fmt.Errorf("点击筛选选项 %q/%q 失败: %w", groupLabel, optionText, err)
-			}
-			return nil
+			return clickInteractable(tag, groupLabel, optionText)
 		}
 		return fmt.Errorf("%w: 筛选组 %q 中未找到选项 %q", errors.ErrSelectorNotFound, groupLabel, optionText)
 	}
 	return fmt.Errorf("%w: 未找到筛选组 %q", errors.ErrSelectorNotFound, groupLabel)
+}
+
+// clickInteractable 在 filterClickTimeout 预算内做 ScrollIntoView + WaitInteractable + Click。
+// 关键：discovery 用的 filterUITimeout 太短，不足以让 click 内部的 Hover/WaitInteractable 完成；
+// 这里把 element 重新绑定到更长的超时，并把任何点击失败映射成 ErrFilterClickFailed。
+func clickInteractable(el *rod.Element, groupLabel, optionText string) error {
+	el = el.Timeout(filterClickTimeout)
+	// 滚到视野内；老元素 / 屏幕外元素 click 容易失败
+	_ = el.ScrollIntoView()
+	if _, err := el.WaitInteractable(); err != nil {
+		return fmt.Errorf("%w: 选项 %q/%q 不可交互: %v", errors.ErrFilterClickFailed, groupLabel, optionText, err)
+	}
+	if err := el.Click(proto.InputMouseButtonLeft, 1); err != nil {
+		return fmt.Errorf("%w: 点击筛选选项 %q/%q 失败: %v", errors.ErrFilterClickFailed, groupLabel, optionText, err)
+	}
+	return nil
 }
 
 // waitForFilterApplied 在 filterApplyTimeout 内做条件竞争。
@@ -361,7 +400,8 @@ func IsFilterError(err error) bool {
 		stderrors.Is(err, errors.ErrLoginRequired),
 		stderrors.Is(err, errors.ErrCaptchaOrSecurity),
 		stderrors.Is(err, errors.ErrEmptyResult),
-		stderrors.Is(err, errors.ErrSelectorNotFound):
+		stderrors.Is(err, errors.ErrSelectorNotFound),
+		stderrors.Is(err, errors.ErrFilterClickFailed):
 		return true
 	}
 	return false

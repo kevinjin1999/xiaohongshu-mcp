@@ -189,7 +189,9 @@ func TestIsFilterError(t *testing.T) {
 		{errors.ErrCaptchaOrSecurity, true},
 		{errors.ErrEmptyResult, true},
 		{errors.ErrSelectorNotFound, true},
+		{errors.ErrFilterClickFailed, true},
 		{fmt.Errorf("wrap: %w", errors.ErrFilterTimeout), true},
+		{fmt.Errorf("wrap: %w", errors.ErrFilterClickFailed), true},
 		{stderrors.New("random"), false},
 		{nil, false},
 	}
@@ -205,4 +207,5 @@ func TestFilterErrorSentinelStrings(t *testing.T) {
 	require.Equal(t, "captcha_or_security_check", errors.ErrCaptchaOrSecurity.Error())
 	require.Equal(t, "empty_result", errors.ErrEmptyResult.Error())
 	require.Equal(t, "selector_not_found", errors.ErrSelectorNotFound.Error())
+	require.Equal(t, "filter_click_failed", errors.ErrFilterClickFailed.Error())
 }

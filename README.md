@@ -877,14 +877,18 @@ npx mcporter list xiaohongshu-mcp
     - 出现安全验证 / 验证码 → 返回 `captcha_or_security_check`
     - feed 列表为空 → 返回 `empty_result`
     - 找不到筛选按钮 / 面板 / 选项 → 返回 `selector_not_found`
+    - 找到选项但点击失败（不可交互 / 面板收起 / 渲染中等） → 返回 `filter_click_failed`
     - 25 秒内 feed 未变化 → 返回 `filter_timeout`
 
     错误信息走 `errors` 包里的 sentinel，可用 `errors.Is(err, errors.ErrFilterTimeout)` 等判断。
 
-  - 手工诊断脚本：
+  - 手工诊断脚本（默认 cookies 路径，或用 `COOKIES_PATH=/path/to/cookies.json` 指定）：
     ```bash
     # 必须先用 cmd/login 完成登录，cookies 保存到本地后再运行
     go run ./cmd/diagnose-search-filter -keyword=美食 -sort_by=最多点赞 -headless=false
+    # 指定 cookies 文件:
+    COOKIES_PATH=~/.xiaohongshu/cookies.json \
+      go run ./cmd/diagnose-search-filter -keyword=美食 -sort_by=最多点赞 -headless=true -timeout=75
     ```
     脚本会打印总耗时和最多 5 条结果；失败时会打印 `error_code: <错误码>`。
 - `get_feed_detail` - 获取帖子详情，包括互动数据和评论（必需：feed_id, xsec_token）
