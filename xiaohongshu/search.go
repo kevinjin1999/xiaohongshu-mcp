@@ -110,6 +110,12 @@ const (
 	// 单次点击预算（包含 ScrollIntoView + WaitInteractable + Hover + Click）。
 	// 比 filterUITimeout 长，给出足够时间让面板/选项渲染稳定。
 	filterClickTimeout = 10 * time.Second
+	// WaitInteractable 单独留 3s 预算；如果元素一直被遮挡 / 动画中，
+	// 不要把整个 click 预算都耗在等"在最上层"上。
+	filterClickWaitInteractable = 3 * time.Second
+	// 一次具体动作（Click 或 Eval）的预算；和 WaitInteractable 分开，
+	// 避免上一步把父 context 烧光。
+	filterClickAction = 5 * time.Second
 	// 面板打开 / hover 后等待动画 (fade-in/slide) 稳定的小延迟。
 	// 没有它，rod 的 WaitInteractable "is on top" 检查会在动画期间误判。
 	filterPanelSettleDelay = 400 * time.Millisecond
@@ -160,7 +166,9 @@ func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...Fi
 //  1. selector 全部按文本定位，不再依赖 nth-child；
 //  2. 不再使用无界的 MustWaitStable；
 //  3. 每次点击前重新 Hover 筛选按钮，并重新查询面板/选项，避免面板收起或句柄过期；
-//  4. 点击完最后一个选项后进入条件竞争，命中以下任一条件就立即返回：
+//  4. 关键：discovery 用 5s 短超时，但 element 句柄重新绑回 page 的长 context，
+//     避免 click / eval 共用了 discovery 已经耗尽的 5s 预算；
+//  5. 点击完最后一个选项后进入条件竞争，命中以下任一条件就立即返回：
 //     - feed 列表指纹变化
 //     - 出现登录弹窗
 //     - 出现安全验证 / 验证码
@@ -174,8 +182,8 @@ func (s *SearchAction) applyFilters(ctx context.Context, filters []internalFilte
 	// 1. 点击前先快照当前 feed，用于检测筛选生效
 	initial := captureSearchSnapshot(page)
 
-	// 2. 短超时找筛选按钮
-	filterBtn, err := page.Timeout(filterUITimeout).Element(`div.filter`)
+	// 2. 短超时找筛选按钮，但句柄绑回 page 的长 context
+	filterBtn, err := findElementShort(page, `div.filter`, filterUITimeout)
 	if err != nil {
 		return fmt.Errorf("%w: 找不到筛选按钮 div.filter: %v", errors.ErrSelectorNotFound, err)
 	}
@@ -190,11 +198,11 @@ func (s *SearchAction) applyFilters(ctx context.Context, filters []internalFilte
 		if err := filterBtn.Hover(); err != nil {
 			return fmt.Errorf("%w: 重新悬停筛选按钮失败: %v", errors.ErrSelectorNotFound, err)
 		}
-		panel, err := page.Timeout(filterUITimeout).Element(`div.filter-panel`)
+		panel, err := findElementShort(page, `div.filter-panel`, filterUITimeout)
 		if err != nil {
 			return fmt.Errorf("%w: 找不到筛选面板 div.filter-panel: %v", errors.ErrSelectorNotFound, err)
 		}
-		if err := clickFilterOption(panel, f.GroupLabel, f.OptionText); err != nil {
+		if err := clickFilterOption(page, panel, f.GroupLabel, f.OptionText); err != nil {
 			return err
 		}
 	}
@@ -203,21 +211,32 @@ func (s *SearchAction) applyFilters(ctx context.Context, filters []internalFilte
 	return waitForFilterApplied(ctx, page, initial)
 }
 
+// findElementShort 用短超时做 selector 存在性检查，但把返回的 element 句柄
+// 绑回 page 的长 context。这样后续的 Click / Eval / WaitInteractable 不会
+// 因为 discovery 的短 context 已经耗尽就立刻 deadline exceeded。
+func findElementShort(page *rod.Page, selector string, timeout time.Duration) (*rod.Element, error) {
+	el, err := page.Timeout(timeout).Element(selector)
+	if err != nil {
+		return nil, err
+	}
+	return el.Context(page.GetContext()), nil
+}
+
 // openFilterPanel 把筛选面板打开。先尝试 hover（XHS 主流交互），不行就 click 兜底。
 func openFilterPanel(page *rod.Page, filterBtn *rod.Element) error {
 	if err := filterBtn.Hover(); err != nil {
 		return fmt.Errorf("%w: 悬停筛选按钮失败: %v", errors.ErrSelectorNotFound, err)
 	}
-	if _, err := page.Timeout(filterUITimeout).Element(`div.filter-panel`); err == nil {
+	if _, err := findElementShort(page, `div.filter-panel`, filterUITimeout); err == nil {
 		// 面板出现后再等一小段动画时间，避免 fade-in 期间 WaitInteractable 误判
 		time.Sleep(filterPanelSettleDelay)
 		return nil
 	}
 	// hover 没出面板，尝试 click 兜底
-	if err := filterBtn.Timeout(filterClickTimeout).Click(proto.InputMouseButtonLeft, 1); err != nil {
+	if err := filterBtn.Click(proto.InputMouseButtonLeft, 1); err != nil {
 		return fmt.Errorf("%w: 悬停未打开面板，点击筛选按钮也失败: %v", errors.ErrFilterClickFailed, err)
 	}
-	if _, err := page.Timeout(filterUITimeout).Element(`div.filter-panel`); err != nil {
+	if _, err := findElementShort(page, `div.filter-panel`, filterUITimeout); err != nil {
 		return fmt.Errorf("%w: 点击筛选按钮后仍找不到面板 div.filter-panel: %v", errors.ErrSelectorNotFound, err)
 	}
 	time.Sleep(filterPanelSettleDelay)
@@ -225,7 +244,7 @@ func openFilterPanel(page *rod.Page, filterBtn *rod.Element) error {
 }
 
 // clickFilterOption 在筛选面板内按文本定位筛选行 + 选项并点击。
-func clickFilterOption(panel *rod.Element, groupLabel, optionText string) error {
+func clickFilterOption(page *rod.Page, panel *rod.Element, groupLabel, optionText string) error {
 	rows, err := panel.Elements(`div.filters`)
 	if err != nil || len(rows) == 0 {
 		return fmt.Errorf("%w: 筛选面板内没有筛选行 div.filters: %v", errors.ErrSelectorNotFound, err)
@@ -245,6 +264,8 @@ func clickFilterOption(panel *rod.Element, groupLabel, optionText string) error 
 			if strings.TrimSpace(t) != optionText {
 				continue
 			}
+			// 句柄重新绑回 page 的长 context，避免继承 discovery 的短超时
+			tag = tag.Context(page.GetContext())
 			return clickInteractable(tag, groupLabel, optionText)
 		}
 		return fmt.Errorf("%w: 筛选组 %q 中未找到选项 %q", errors.ErrSelectorNotFound, groupLabel, optionText)
@@ -252,44 +273,106 @@ func clickFilterOption(panel *rod.Element, groupLabel, optionText string) error 
 	return fmt.Errorf("%w: 未找到筛选组 %q", errors.ErrSelectorNotFound, groupLabel)
 }
 
-// clickInteractable 在 filterClickTimeout 预算内点击筛选选项。
+// clickInteractable 用三层策略点击筛选选项。
 //
 // 策略：
-//  1. 优先用 go-rod 的真实鼠标点击（ScrollIntoView + WaitInteractable + Click），
-//     这是 CLAUDE.md 推荐的路径。
-//  2. 如果 WaitInteractable / Click 因 XHS 面板的 fade-in 动画 / 透明 overlay /
-//     pointer-events 链路问题判定 not interactable，再用一段 JS click 兜底。
+//  1. 优先用 go-rod 真实鼠标点击（ScrollIntoView + WaitInteractable + Click），
+//     这是 CLAUDE.md 推荐的路径。WaitInteractable 限定 3s，避免吃光全部预算。
+//  2. WaitInteractable / Click 失败时，用一段 JS dispatchEvent('click', bubbles)
+//     兜底。绕开 z-index/overlay/动画判定。
+//  3. 全部失败时，再做一次诊断 JS 输出 bbox / 可见性 / elementFromPoint，
+//     方便定位 DOM 实际响应的容器。
 //
-// 为什么需要 JS 兜底（而不是单纯调更长 timeout）：
-//   - 真实测试发现 `排序依据/最多点赞` 这一项在 10s 内一直 "not interactable"，
-//     表现是 rod 的"中心点不在最上层"检查持续失败，但 onClick handler 本身可用，
-//     用 JS 触发 click 事件能正确选中。
-//   - 这是一段 ~3 行、仅在 rod 路径已失败时才走的兜底，不属于 CLAUDE.md 所说的
-//     "大量 JS 注入"。
+// 关键：每个步骤都重新 .Context(page) / .Timeout() 派生独立预算，避免上一步
+// 把整个父 context 烧光。
 func clickInteractable(el *rod.Element, groupLabel, optionText string) error {
-	el = el.Timeout(filterClickTimeout)
-
-	// 滚到视野内；老元素 / 屏幕外元素 click 容易失败
+	// 滚到视野内
 	_ = el.ScrollIntoView()
 
-	// 1. 优先 go-rod 真实鼠标点击
-	if _, werr := el.WaitInteractable(); werr != nil {
+	// 1. 优先 go-rod 真实鼠标点击：WaitInteractable 限定 3s，避免吃光预算
+	waitEl := el.Timeout(filterClickWaitInteractable)
+	if _, werr := waitEl.WaitInteractable(); werr != nil {
 		logrus.WithFields(logrus.Fields{
 			"group": groupLabel, "option": optionText, "err": werr,
 		}).Debug("WaitInteractable failed, fallback to JS click")
-	} else if cerr := el.Click(proto.InputMouseButtonLeft, 1); cerr != nil {
-		logrus.WithFields(logrus.Fields{
-			"group": groupLabel, "option": optionText, "err": cerr,
-		}).Debug("rod click failed, fallback to JS click")
 	} else {
-		return nil
+		// Click 用一个独立的 5s 预算
+		clickEl := el.Timeout(filterClickAction)
+		if cerr := clickEl.Click(proto.InputMouseButtonLeft, 1); cerr == nil {
+			return nil
+		} else {
+			logrus.WithFields(logrus.Fields{
+				"group": groupLabel, "option": optionText, "err": cerr,
+			}).Debug("rod click failed, fallback to JS click")
+		}
 	}
 
-	// 2. JS click 兜底：直接派发 click 事件，绕开 z-index/overlay/动画判定
-	if _, err := el.Eval(`() => this.click()`); err != nil {
+	// 2. JS click 兜底：派发可冒泡的 MouseEvent，更接近真实点击
+	jsEl := el.Timeout(filterClickAction)
+	if _, err := jsEl.Eval(jsClickScript); err != nil {
+		// 3. 诊断：rod + JS 都失败时，输出 DOM 现场，方便后续排查
+		logClickDiagnostics(el, groupLabel, optionText)
 		return fmt.Errorf("%w: 选项 %q/%q rod+JS 都点不动: %v", errors.ErrFilterClickFailed, groupLabel, optionText, err)
 	}
 	return nil
+}
+
+// jsClickScript 派发一个可冒泡的 click MouseEvent，并把 mousedown / mouseup
+// 顺序也补上。比直接 this.click() 更接近真实鼠标点击，能触发事件委托。
+const jsClickScript = `() => {
+	const r = this.getBoundingClientRect();
+	const x = r.left + r.width / 2;
+	const y = r.top + r.height / 2;
+	const opts = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, button: 0 };
+	this.dispatchEvent(new MouseEvent('mousedown', opts));
+	this.dispatchEvent(new MouseEvent('mouseup', opts));
+	this.dispatchEvent(new MouseEvent('click', opts));
+	return { x, y };
+}`
+
+// logClickDiagnostics 在 rod + JS 都失败时输出诊断信息：
+// bbox / computed style / elementFromPoint / 是否在 viewport 内。
+// JS 内部 JSON.stringify，避免 gson.JSON.Str() 对 object 返回空。
+func logClickDiagnostics(el *rod.Element, groupLabel, optionText string) {
+	res, err := el.Timeout(2 * time.Second).Eval(`() => {
+		const r = this.getBoundingClientRect();
+		const x = r.left + r.width / 2;
+		const y = r.top + r.height / 2;
+		const cs = window.getComputedStyle(this);
+		const top = document.elementFromPoint(x, y);
+		const topInfo = top ? {
+			tag: top.tagName,
+			cls: top.className,
+			text: (top.textContent || '').slice(0, 40),
+			isSelf: top === this,
+			isDescendant: this.contains(top),
+			isAncestor: top.contains(this),
+		} : null;
+		return JSON.stringify({
+			bbox: { x: r.x, y: r.y, w: r.width, h: r.height },
+			center: { x, y },
+			inViewport: r.bottom > 0 && r.right > 0 && r.top < innerHeight && r.left < innerWidth,
+			style: {
+				display: cs.display,
+				visibility: cs.visibility,
+				pointerEvents: cs.pointerEvents,
+				zIndex: cs.zIndex,
+				opacity: cs.opacity,
+			},
+			elementFromPoint: topInfo,
+			html: (this.outerHTML || '').slice(0, 200),
+		});
+	}`)
+	if err != nil {
+		logrus.WithFields(logrus.Fields{"group": groupLabel, "option": optionText, "err": err}).
+			Warn("filter click diagnostics eval failed")
+		return
+	}
+	logrus.WithFields(logrus.Fields{
+		"group":  groupLabel,
+		"option": optionText,
+		"info":   res.Value.Str(),
+	}).Warn("filter click failed; diagnostics dumped (用以排查 onClick 是否绑在 div.tags 上)")
 }
 
 // waitForFilterApplied 在 filterApplyTimeout 内做条件竞争。
