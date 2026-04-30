@@ -207,8 +207,20 @@ func (s *SearchAction) applyFilters(ctx context.Context, filters []internalFilte
 		}
 	}
 
-	// 5. 条件竞争：等待筛选生效或快速失败
+	// 5. 把鼠标移开筛选区，让 hover 触发的面板收起，触发"提交"。
+	// 部分 UI 选项是 hover-保持+click 模型，关掉面板才会真正 apply。
+	closeFilterPanel(page)
+
+	// 6. 条件竞争：等待筛选生效或快速失败
 	return waitForFilterApplied(ctx, page, initial)
+}
+
+// closeFilterPanel 把鼠标移到 (0,0)，关掉 hover 触发的筛选面板。
+// 用于触发 "click 选项后还要关面板才提交" 的 UI。失败不算错。
+func closeFilterPanel(page *rod.Page) {
+	if err := page.Mouse.MoveTo(proto.Point{X: 0, Y: 0}); err != nil {
+		logrus.WithError(err).Debug("move mouse to (0,0) failed; ignored")
+	}
 }
 
 // findElementShort 用短超时做 selector 存在性检查，但把返回的 element 句柄
@@ -396,17 +408,22 @@ func waitForFilterApplied(ctx context.Context, page *rod.Page, initial searchSna
 		case stateEmpty:
 			return errors.ErrEmptyResult
 		case stateFeeds:
-			if cur.Fingerprint != "" && cur.Fingerprint != initial.Fingerprint {
+			if filterChanged(initial, cur) {
 				return nil
 			}
 		}
 
 		if time.Now().After(deadline) {
 			logrus.WithFields(logrus.Fields{
-				"initial_fp": initial.Fingerprint,
-				"current_fp": cur.Fingerprint,
-				"state":      cur.State,
-			}).Warn("search filter apply timed out")
+				"initial_fp":      initial.Fingerprint,
+				"current_fp":      cur.Fingerprint,
+				"initial_url":     initial.URLSearch,
+				"current_url":     cur.URLSearch,
+				"initial_active":  initial.ActiveFilters,
+				"current_active":  cur.ActiveFilters,
+				"state":           cur.State,
+				"feeds_len_match": cur.Fingerprint != "" && cur.Fingerprint == initial.Fingerprint,
+			}).Warn("search filter apply timed out (no signal changed)")
 			return errors.ErrFilterTimeout
 		}
 
@@ -422,6 +439,20 @@ func waitForFilterApplied(ctx context.Context, page *rod.Page, initial searchSna
 func pageHas(page *rod.Page, selector string) bool {
 	has, _, _ := page.Has(selector)
 	return has
+}
+
+// filterChanged 用多信号 OR 判断筛选是否生效。任意一个维度变化都算。
+func filterChanged(initial, cur searchSnapshot) bool {
+	if cur.Fingerprint != "" && cur.Fingerprint != initial.Fingerprint {
+		return true
+	}
+	if cur.URLSearch != "" && cur.URLSearch != initial.URLSearch {
+		return true
+	}
+	if cur.ActiveFilters != initial.ActiveFilters {
+		return true
+	}
+	return false
 }
 
 // extractFeedsFromPage 读取 __INITIAL_STATE__ 中的 feeds 列表。
@@ -450,10 +481,23 @@ func extractFeedsFromPage(page *rod.Page) ([]Feed, error) {
 	return feeds, nil
 }
 
-// searchSnapshot 表示某一时刻搜索页 __INITIAL_STATE__ 的指纹，用于检测筛选生效。
+// searchSnapshot 表示某一时刻搜索页的多维度指纹。
+//
+// 单一来源（top-3 feed id）不够：实测发现"最多点赞"筛选时，22 条 feed 的
+// 顺序变了，但前两条恰好是默认排序也排在前面的高赞 note，top-3 fingerprint
+// 没明显变化，会误判筛选未生效。
+//
+// 现在多信号 OR：
+//   - Fingerprint: __INITIAL_STATE__.search.feeds 的 length + 全部 id 拼接
+//   - URLSearch: location.search（XHS 部分版本会把 sort= 写进 query）
+//   - ActiveFilters: 当前面板里 .active/.selected 标签的文本
+//
+// 任何一个变化都视为筛选生效。
 type searchSnapshot struct {
-	State       string `json:"state"`       // stateFeeds / stateEmpty / stateUnknown
-	Fingerprint string `json:"fingerprint"` // length:firstId,secondId,thirdId
+	State         string `json:"state"`         // stateFeeds / stateEmpty / stateUnknown
+	Fingerprint   string `json:"fingerprint"`   // length:id1,id2,...,idN
+	URLSearch     string `json:"urlSearch"`     // location.search
+	ActiveFilters string `json:"activeFilters"` // joined active/selected tag texts
 }
 
 const (
@@ -463,9 +507,24 @@ const (
 )
 
 // captureSnapshotJS 在浏览器内运行的快照脚本。挑这点 JS 是因为 __INITIAL_STATE__
-// 是页面级 JS 全局变量，无法直接通过 go-rod 的 DOM 查询拿到。
+// 是页面级 JS 全局变量，无法直接通过 go-rod 的 DOM 查询拿到；URL / DOM 查询则
+// 顺手一起做掉，避免多次 RPC。
 const captureSnapshotJS = `() => {
-	const out = { state: 'unknown', fingerprint: '' };
+	const out = { state: 'unknown', fingerprint: '', urlSearch: '', activeFilters: '' };
+	out.urlSearch = location.search || '';
+
+	// 当前面板里 active/selected 的筛选项文本
+	const activeNodes = document.querySelectorAll(
+		'div.filter-panel .active, div.filter-panel .selected, ' +
+			'div.filter-panel [class*="active"], div.filter-panel [class*="selected"]'
+	);
+	const activeTexts = [];
+	activeNodes.forEach(n => {
+		const t = (n.textContent || '').trim();
+		if (t) activeTexts.push(t);
+	});
+	out.activeFilters = activeTexts.join('|');
+
 	if (window.__INITIAL_STATE__ &&
 	    window.__INITIAL_STATE__.search &&
 	    window.__INITIAL_STATE__.search.feeds) {
@@ -476,7 +535,8 @@ const captureSnapshotJS = `() => {
 				out.state = 'empty';
 			} else {
 				out.state = 'feeds';
-				const ids = data.slice(0, 3).map(f => (f && f.id) || '');
+				// 全量 id（不再只取 top-3），任何顺序变化都能识别
+				const ids = data.map(f => (f && f.id) || '');
 				out.fingerprint = data.length + ':' + ids.join(',');
 			}
 		}

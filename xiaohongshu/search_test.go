@@ -147,27 +147,34 @@ func TestValidateInternalFilterOption_Empty(t *testing.T) {
 
 func TestParseSearchSnapshot(t *testing.T) {
 	cases := []struct {
-		name      string
-		raw       string
-		wantState string
-		wantFp    string
+		name       string
+		raw        string
+		wantState  string
+		wantFp     string
+		wantURL    string
+		wantActive string
 	}{
-		{"空字符串视为未知", "", stateUnknown, ""},
-		{"非法 JSON 视为未知", "not-json", stateUnknown, ""},
+		{"空字符串视为未知", "", stateUnknown, "", "", ""},
+		{"非法 JSON 视为未知", "not-json", stateUnknown, "", "", ""},
 		{
 			"有 feed 时返回 feeds 状态及指纹",
-			`{"state":"feeds","fingerprint":"3:a,b,c"}`,
-			stateFeeds, "3:a,b,c",
+			`{"state":"feeds","fingerprint":"3:a,b,c","urlSearch":"?keyword=x","activeFilters":""}`,
+			stateFeeds, "3:a,b,c", "?keyword=x", "",
 		},
 		{
 			"empty 状态保留",
-			`{"state":"empty","fingerprint":""}`,
-			stateEmpty, "",
+			`{"state":"empty","fingerprint":"","urlSearch":"","activeFilters":""}`,
+			stateEmpty, "", "", "",
 		},
 		{
 			"未知状态默认填 unknown",
 			`{"fingerprint":"x"}`,
-			stateUnknown, "x",
+			stateUnknown, "x", "", "",
+		},
+		{
+			"完整多信号字段",
+			`{"state":"feeds","fingerprint":"22:id1,id2","urlSearch":"?keyword=美食&sort=hot","activeFilters":"最多点赞"}`,
+			stateFeeds, "22:id1,id2", "?keyword=美食&sort=hot", "最多点赞",
 		},
 	}
 	for _, c := range cases {
@@ -175,6 +182,52 @@ func TestParseSearchSnapshot(t *testing.T) {
 			got := parseSearchSnapshot(c.raw)
 			require.Equal(t, c.wantState, got.State)
 			require.Equal(t, c.wantFp, got.Fingerprint)
+			require.Equal(t, c.wantURL, got.URLSearch)
+			require.Equal(t, c.wantActive, got.ActiveFilters)
+		})
+	}
+}
+
+func TestFilterChanged(t *testing.T) {
+	base := searchSnapshot{
+		State: stateFeeds, Fingerprint: "22:a,b,c", URLSearch: "?keyword=x", ActiveFilters: "",
+	}
+
+	cases := []struct {
+		name string
+		cur  searchSnapshot
+		want bool
+	}{
+		{"完全相同 → 未变化", base, false},
+		{
+			"fingerprint 变化",
+			searchSnapshot{State: stateFeeds, Fingerprint: "22:a,b,d", URLSearch: base.URLSearch, ActiveFilters: base.ActiveFilters},
+			true,
+		},
+		{
+			"URL 变化",
+			searchSnapshot{State: stateFeeds, Fingerprint: base.Fingerprint, URLSearch: "?keyword=x&sort=hot", ActiveFilters: base.ActiveFilters},
+			true,
+		},
+		{
+			"active filter 变化",
+			searchSnapshot{State: stateFeeds, Fingerprint: base.Fingerprint, URLSearch: base.URLSearch, ActiveFilters: "最多点赞"},
+			true,
+		},
+		{
+			"fingerprint 为空不算变化",
+			searchSnapshot{State: stateFeeds, Fingerprint: "", URLSearch: base.URLSearch, ActiveFilters: base.ActiveFilters},
+			false,
+		},
+		{
+			"URL 为空不算变化",
+			searchSnapshot{State: stateFeeds, Fingerprint: base.Fingerprint, URLSearch: "", ActiveFilters: base.ActiveFilters},
+			false,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			require.Equal(t, c.want, filterChanged(base, c.cur))
 		})
 	}
 }
