@@ -110,6 +110,9 @@ const (
 	// 单次点击预算（包含 ScrollIntoView + WaitInteractable + Hover + Click）。
 	// 比 filterUITimeout 长，给出足够时间让面板/选项渲染稳定。
 	filterClickTimeout = 10 * time.Second
+	// 面板打开 / hover 后等待动画 (fade-in/slide) 稳定的小延迟。
+	// 没有它，rod 的 WaitInteractable "is on top" 检查会在动画期间误判。
+	filterPanelSettleDelay = 400 * time.Millisecond
 	// 整个筛选生效的总预算，issue 要求 15-30s 内必须给出结论。
 	filterApplyTimeout = 25 * time.Second
 	// 筛选生效轮询间隔。
@@ -206,6 +209,8 @@ func openFilterPanel(page *rod.Page, filterBtn *rod.Element) error {
 		return fmt.Errorf("%w: 悬停筛选按钮失败: %v", errors.ErrSelectorNotFound, err)
 	}
 	if _, err := page.Timeout(filterUITimeout).Element(`div.filter-panel`); err == nil {
+		// 面板出现后再等一小段动画时间，避免 fade-in 期间 WaitInteractable 误判
+		time.Sleep(filterPanelSettleDelay)
 		return nil
 	}
 	// hover 没出面板，尝试 click 兜底
@@ -215,6 +220,7 @@ func openFilterPanel(page *rod.Page, filterBtn *rod.Element) error {
 	if _, err := page.Timeout(filterUITimeout).Element(`div.filter-panel`); err != nil {
 		return fmt.Errorf("%w: 点击筛选按钮后仍找不到面板 div.filter-panel: %v", errors.ErrSelectorNotFound, err)
 	}
+	time.Sleep(filterPanelSettleDelay)
 	return nil
 }
 
@@ -246,18 +252,42 @@ func clickFilterOption(panel *rod.Element, groupLabel, optionText string) error 
 	return fmt.Errorf("%w: 未找到筛选组 %q", errors.ErrSelectorNotFound, groupLabel)
 }
 
-// clickInteractable 在 filterClickTimeout 预算内做 ScrollIntoView + WaitInteractable + Click。
-// 关键：discovery 用的 filterUITimeout 太短，不足以让 click 内部的 Hover/WaitInteractable 完成；
-// 这里把 element 重新绑定到更长的超时，并把任何点击失败映射成 ErrFilterClickFailed。
+// clickInteractable 在 filterClickTimeout 预算内点击筛选选项。
+//
+// 策略：
+//  1. 优先用 go-rod 的真实鼠标点击（ScrollIntoView + WaitInteractable + Click），
+//     这是 CLAUDE.md 推荐的路径。
+//  2. 如果 WaitInteractable / Click 因 XHS 面板的 fade-in 动画 / 透明 overlay /
+//     pointer-events 链路问题判定 not interactable，再用一段 JS click 兜底。
+//
+// 为什么需要 JS 兜底（而不是单纯调更长 timeout）：
+//   - 真实测试发现 `排序依据/最多点赞` 这一项在 10s 内一直 "not interactable"，
+//     表现是 rod 的"中心点不在最上层"检查持续失败，但 onClick handler 本身可用，
+//     用 JS 触发 click 事件能正确选中。
+//   - 这是一段 ~3 行、仅在 rod 路径已失败时才走的兜底，不属于 CLAUDE.md 所说的
+//     "大量 JS 注入"。
 func clickInteractable(el *rod.Element, groupLabel, optionText string) error {
 	el = el.Timeout(filterClickTimeout)
+
 	// 滚到视野内；老元素 / 屏幕外元素 click 容易失败
 	_ = el.ScrollIntoView()
-	if _, err := el.WaitInteractable(); err != nil {
-		return fmt.Errorf("%w: 选项 %q/%q 不可交互: %v", errors.ErrFilterClickFailed, groupLabel, optionText, err)
+
+	// 1. 优先 go-rod 真实鼠标点击
+	if _, werr := el.WaitInteractable(); werr != nil {
+		logrus.WithFields(logrus.Fields{
+			"group": groupLabel, "option": optionText, "err": werr,
+		}).Debug("WaitInteractable failed, fallback to JS click")
+	} else if cerr := el.Click(proto.InputMouseButtonLeft, 1); cerr != nil {
+		logrus.WithFields(logrus.Fields{
+			"group": groupLabel, "option": optionText, "err": cerr,
+		}).Debug("rod click failed, fallback to JS click")
+	} else {
+		return nil
 	}
-	if err := el.Click(proto.InputMouseButtonLeft, 1); err != nil {
-		return fmt.Errorf("%w: 点击筛选选项 %q/%q 失败: %v", errors.ErrFilterClickFailed, groupLabel, optionText, err)
+
+	// 2. JS click 兜底：直接派发 click 事件，绕开 z-index/overlay/动画判定
+	if _, err := el.Eval(`() => this.click()`); err != nil {
+		return fmt.Errorf("%w: 选项 %q/%q rod+JS 都点不动: %v", errors.ErrFilterClickFailed, groupLabel, optionText, err)
 	}
 	return nil
 }
