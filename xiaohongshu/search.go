@@ -119,6 +119,10 @@ const (
 	// 面板打开 / hover 后等待动画 (fade-in/slide) 稳定的小延迟。
 	// 没有它，rod 的 WaitInteractable "is on top" 检查会在动画期间误判。
 	filterPanelSettleDelay = 400 * time.Millisecond
+	// 单次 click 后 poll active class 的预算。click 即使触发了 reactive
+	// 更新也不一定立刻见效，给 2s 让 Vue/React 渲染 reactive 状态。
+	classActivePollBudget   = 2 * time.Second
+	classActivePollInterval = 100 * time.Millisecond
 	// 整个筛选生效的总预算，issue 要求 15-30s 内必须给出结论。
 	filterApplyTimeout = 25 * time.Second
 	// 筛选生效轮询间隔。
@@ -290,11 +294,17 @@ func openFilterPanel(page *rod.Page, filterBtn *rod.Element) error {
 	return nil
 }
 
-// clickFilterOption 在筛选面板内按文本定位筛选行 + 选项并点击。
+// clickFilterOption 在筛选面板内按文本定位筛选行 + 选项并点击，并验证选项
+// 真的进入了 active 状态。
 //
 // 返回 alreadyActive=true 表示目标选项点击前就已经是 active/selected
 // 状态（典型：sort_by=综合 是默认值）。这种情况下没点也不需要等待，
 // 直接当成功。
+//
+// 多策略点击：实测 XHS 部分版本里 `div.tags` 上没绑 onClick handler，
+// 真实 click 落在 `div.tags` 上不会触发任何 UI / XHR。所以一次 click 后
+// 不立刻成功就要换更深 / 更宽的目标再试一次。每次 click 后 polling
+// 检查 active class，2s 内变成 active 即认定成功。
 func clickFilterOption(page *rod.Page, panel *rod.Element, groupLabel, optionText string) (alreadyActive bool, err error) {
 	rows, err := panel.Elements(`div.filters`)
 	if err != nil || len(rows) == 0 {
@@ -317,39 +327,137 @@ func clickFilterOption(page *rod.Page, panel *rod.Element, groupLabel, optionTex
 			}
 			// 句柄重新绑回 page 的长 context，避免继承 discovery 的短超时
 			tag = tag.Context(page.GetContext())
-
-			// 点击前先看选项是不是已经选中。已经选中说明默认就是这个值，
-			// 没必要点也没必要等（不然 sort_by=综合 永远 timeout）。
-			beforeClass := elementClass(tag)
-			if isClassActive(beforeClass) {
-				logrus.WithFields(logrus.Fields{
-					"group": groupLabel, "option": optionText, "class": beforeClass,
-				}).Info("filter option already active; skipping click")
-				return true, nil
-			}
-
-			if err := clickInteractable(tag, groupLabel, optionText); err != nil {
-				return false, err
-			}
-
-			// 点击后立刻读 class，让 logs 能看到 click 是否触发了 UI handler。
-			// 如果 after_active=true 但后面 feed 没变 → click 只触发了 UI 层，
-			// 没触发搜索 XHR（很可能是 synthetic-event 被 isTrusted 检查滤掉）。
-			// 如果 after_active=false → click 根本没到目标元素的 handler。
-			afterClass := elementClass(tag)
-			logrus.WithFields(logrus.Fields{
-				"group":              groupLabel,
-				"option":             optionText,
-				"before_class":       beforeClass,
-				"after_class":        afterClass,
-				"active_after_click": isClassActive(afterClass),
-			}).Info("filter option clicked")
-
-			return false, nil
+			return clickFilterTagWithStrategies(tag, groupLabel, optionText)
 		}
 		return false, fmt.Errorf("%w: 筛选组 %q 中未找到选项 %q", errors.ErrSelectorNotFound, groupLabel, optionText)
 	}
 	return false, fmt.Errorf("%w: 未找到筛选组 %q", errors.ErrSelectorNotFound, groupLabel)
+}
+
+// clickFilterTagWithStrategies 对找到的 tag 元素尝试多种 click 策略。
+// 返回 alreadyActive=true 表示进来时就已经是激活态。
+//
+// 策略链：
+//  1. rod 真实鼠标点击 div.tags 自身（覆盖大多数 XHS UI 版本）
+//  2. rod 真实鼠标点击 div.tags 的第一个后代元素（XHS 把 handler 绑在
+//     <span class="tag-name"> 这种内层元素的版本）
+//  3. JS 在中心点 dispatch click（最后的兜底，trust 不一定够，但偶尔有用）
+//
+// 每次 click 后 poll 2s 检查 class 是否变成 active；一旦命中立即返回成功。
+// 全部失败 → 输出 DOM 现场（outerHTML / 子元素 / elementFromPoint）+ 返回
+// `ErrFilterClickFailed`，不再让外层多等 25s 退 `filter_timeout`。
+func clickFilterTagWithStrategies(tag *rod.Element, groupLabel, optionText string) (bool, error) {
+	beforeClass := elementClass(tag)
+	if isClassActive(beforeClass) {
+		logrus.WithFields(logrus.Fields{
+			"group": groupLabel, "option": optionText, "class": beforeClass,
+		}).Info("filter option already active; skipping click")
+		return true, nil
+	}
+
+	// 一开始就 dump 一次 DOM 结构 (Debug 级)，方便不熟悉的 XHS 变体定位。
+	logrus.WithFields(captureTagShape(tag)).Debug("filter tag pre-click shape")
+
+	type strategy struct {
+		name string
+		fn   func() error
+	}
+
+	strategies := []strategy{
+		{
+			name: "rod-direct",
+			fn:   func() error { return clickInteractable(tag, groupLabel, optionText) },
+		},
+		{
+			name: "rod-first-child",
+			fn: func() error {
+				children, err := tag.Elements(`*`)
+				if err != nil || len(children) == 0 {
+					return fmt.Errorf("no descendants under div.tags: %v", err)
+				}
+				return clickInteractable(children[0], groupLabel, optionText)
+			},
+		},
+		{
+			name: "js-element-from-point",
+			fn:   func() error { return clickViaElementFromPoint(tag) },
+		},
+	}
+
+	for _, s := range strategies {
+		if err := s.fn(); err != nil {
+			logrus.WithFields(logrus.Fields{
+				"group": groupLabel, "option": optionText, "strategy": s.name, "err": err,
+			}).Warn("click strategy failed; trying next")
+			continue
+		}
+		// 等 class 真的变成 active；2s 内不变就当作没生效，进下一个策略
+		if waitForClassActive(tag, classActivePollBudget) {
+			logrus.WithFields(logrus.Fields{
+				"group": groupLabel, "option": optionText, "strategy": s.name,
+				"after_class": elementClass(tag),
+			}).Info("filter option clicked & activated")
+			return false, nil
+		}
+		logrus.WithFields(logrus.Fields{
+			"group": groupLabel, "option": optionText, "strategy": s.name,
+			"after_class": elementClass(tag),
+		}).Warn("click strategy returned ok but class did not activate within budget")
+	}
+
+	// 全部失败：dump DOM 现场（含 elementFromPoint），让用户能定位真实点击目标
+	logClickDiagnostics(tag, groupLabel, optionText)
+	return false, fmt.Errorf("%w: 选项 %q/%q 多种点击策略均未激活, class 仍是 %q",
+		errors.ErrFilterClickFailed, groupLabel, optionText, elementClass(tag))
+}
+
+// waitForClassActive poll element 的 class 直到含 active/selected 或超时。
+func waitForClassActive(el *rod.Element, budget time.Duration) bool {
+	deadline := time.Now().Add(budget)
+	for {
+		if isClassActive(elementClass(el)) {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(classActivePollInterval)
+	}
+}
+
+// clickViaElementFromPoint 用 JS 在 tag 中心点拿 elementFromPoint，对那个
+// 实际最上层元素 dispatch 完整鼠标事件序列。是兜底策略；若 XHS 检查 isTrusted
+// 此路也会失效。
+func clickViaElementFromPoint(el *rod.Element) error {
+	_, err := el.Eval(`() => {
+		const r = this.getBoundingClientRect();
+		const x = r.left + r.width / 2;
+		const y = r.top + r.height / 2;
+		const target = document.elementFromPoint(x, y) || this;
+		const opts = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, button: 0 };
+		target.dispatchEvent(new MouseEvent('mousedown', opts));
+		target.dispatchEvent(new MouseEvent('mouseup', opts));
+		target.dispatchEvent(new MouseEvent('click', opts));
+		return true;
+	}`)
+	return err
+}
+
+// captureTagShape 拿 tag 的简要结构（outerHTML 截短 + 子元素列表）做 logs。
+func captureTagShape(el *rod.Element) logrus.Fields {
+	res, err := el.Eval(`() => {
+		const html = (this.outerHTML || '').slice(0, 200);
+		const children = Array.from(this.children || []).map(c => ({
+			tag: c.tagName,
+			cls: c.className,
+			text: (c.textContent || '').slice(0, 30),
+		}));
+		return JSON.stringify({ html, children });
+	}`)
+	if err != nil || res == nil {
+		return logrus.Fields{"shape_err": err}
+	}
+	return logrus.Fields{"tag_shape": res.Value.Str()}
 }
 
 // elementClass 读 element 的 class 属性；空值或读取失败都返回 ""。

@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"github.com/xpzouying/xiaohongshu-mcp/browser"
@@ -238,6 +239,16 @@ func TestFilterChanged(t *testing.T) {
 			require.Equal(t, c.want, filterChanged(base, c.cur))
 		})
 	}
+}
+
+func TestClickStrategyConstants(t *testing.T) {
+	// 守护这两个 budget 不被改成 0 / 巨大值，避免 click 等待行为变化。
+	require.Greater(t, int64(classActivePollBudget), int64(0))
+	require.LessOrEqual(t, classActivePollBudget, 5*time.Second,
+		"click 后 poll active class 不应该超过 5s，否则 timeout 体验差")
+	require.Greater(t, int64(classActivePollInterval), int64(0))
+	require.Less(t, classActivePollInterval, classActivePollBudget,
+		"poll interval 必须小于 budget")
 }
 
 func TestIsClassActive(t *testing.T) {
