@@ -127,6 +127,10 @@ const (
 	filterApplyTimeout = 25 * time.Second
 	// 筛选生效轮询间隔。
 	filterPollInterval = 250 * time.Millisecond
+	// 看到 __INITIAL_STATE__.search.feeds = [] 时不要立刻当 ErrEmptyResult。
+	// XHS 切换排序时会先把 feeds 数组清空（loading），再用 XHR 结果回填，
+	// 第一次 poll 经常恰好踩在清空瞬间。给 5s 让新数据回填。
+	filterEmptyStateGrace = 5 * time.Second
 )
 
 func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...FilterOption) ([]Feed, error) {
@@ -749,10 +753,18 @@ func logClickDiagnostics(el *rod.Element, groupLabel, optionText string) {
 }
 
 // waitForFilterApplied 在 filterApplyTimeout 内做条件竞争。
+//
+// 特别处理 stateEmpty：XHS 切换排序时会把 feeds 数组先清空（loading）再用
+// XHR 结果回填，第一次 poll 经常恰好踩在清空瞬间。看到 empty 不立刻返
+// ErrEmptyResult，而是给 filterEmptyStateGrace 让数据回填，超过这个 grace
+// 还是空才认定真的没结果。
 func waitForFilterApplied(ctx context.Context, page *rod.Page, initial searchSnapshot) error {
 	deadline := time.Now().Add(filterApplyTimeout)
 	ticker := time.NewTicker(filterPollInterval)
 	defer ticker.Stop()
+
+	var emptySince time.Time       // 第一次看到 stateEmpty 的时刻；feeds 回填时清零
+	var emptyDiagnosticDumped bool // 在 grace 期间只 dump 一次 feeds 结构
 
 	for {
 		// 登录弹窗：扫码登录组件出现
@@ -767,8 +779,28 @@ func waitForFilterApplied(ctx context.Context, page *rod.Page, initial searchSna
 		cur := captureSearchSnapshot(page)
 		switch cur.State {
 		case stateEmpty:
-			return errors.ErrEmptyResult
+			if emptySince.IsZero() {
+				emptySince = time.Now()
+				logrus.WithFields(logrus.Fields{
+					"grace":          filterEmptyStateGrace.String(),
+					"initial_fp":     initial.Fingerprint,
+					"current_active": cur.ActiveFilters,
+				}).Info("filter result currently empty; waiting for XHR to repopulate (grace)")
+			}
+			if !emptyDiagnosticDumped {
+				logFeedsStructure(page, "while empty (waiting for repopulate)")
+				emptyDiagnosticDumped = true
+			}
+			if time.Since(emptySince) > filterEmptyStateGrace {
+				// 真的空：grace 期间数据没回来
+				logrus.WithFields(logrus.Fields{
+					"empty_for": time.Since(emptySince).String(),
+				}).Warn("filter result remained empty beyond grace; returning empty_result")
+				return errors.ErrEmptyResult
+			}
+			// 还在 grace 内：继续 poll
 		case stateFeeds:
+			emptySince = time.Time{} // feeds 回填了，清零
 			if filterChanged(initial, cur) {
 				return nil
 			}
@@ -805,6 +837,41 @@ func waitForFilterApplied(ctx context.Context, page *rod.Page, initial searchSna
 		case <-ticker.C:
 		}
 	}
+}
+
+// logFeedsStructure dump __INITIAL_STATE__.search.* 的结构（keys + 长度），
+// 帮助定位"feeds 不是空数组而是放到了别的字段下"这类情况。
+func logFeedsStructure(page *rod.Page, when string) {
+	res, err := page.Eval(`() => {
+		const out = { ok: true };
+		try {
+			if (!window.__INITIAL_STATE__) { out.has_state = false; return JSON.stringify(out); }
+			out.state_keys = Object.keys(window.__INITIAL_STATE__);
+			const search = window.__INITIAL_STATE__.search;
+			if (!search) { out.has_search = false; return JSON.stringify(out); }
+			out.search_keys = Object.keys(search);
+			if (search.feeds) {
+				const f = search.feeds;
+				out.feeds_keys = Object.keys(f);
+				out.feeds_value_isArray = Array.isArray(f.value);
+				out.feeds_value_len = Array.isArray(f.value) ? f.value.length : null;
+				out.feeds__value_isArray = Array.isArray(f._value);
+				out.feeds__value_len = Array.isArray(f._value) ? f._value.length : null;
+			}
+			// 也看下 DOM 上有几张可见 feed 卡片，作为另一个独立信号
+			const cards = document.querySelectorAll('section.note-item, [class*="note-item"], [data-note-id]');
+			out.dom_card_count = cards.length;
+		} catch (e) { out.err = String(e); }
+		return JSON.stringify(out);
+	}`)
+	if err != nil || res == nil {
+		logrus.WithError(err).Warn("logFeedsStructure eval failed")
+		return
+	}
+	logrus.WithFields(logrus.Fields{
+		"when": when,
+		"info": res.Value.Str(),
+	}).Warn("feeds structure diagnostic")
 }
 
 // pageHas 是 page.Has 的安全封装，错误吞掉视为不存在。
