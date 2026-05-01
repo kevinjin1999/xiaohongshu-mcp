@@ -179,7 +179,8 @@ func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...Fi
 func (s *SearchAction) applyFilters(ctx context.Context, filters []internalFilterOption) error {
 	page := s.page.Context(ctx)
 
-	// 1. 点击前先快照当前 feed，用于检测筛选生效
+	// 1. 点击前先快照当前 feed（fingerprint/url），后面 wait 阶段用它对比。
+	//    ActiveFilters 这里都是空的，因为面板还没打开。
 	initial := captureSearchSnapshot(page)
 
 	// 2. 短超时找筛选按钮，但句柄绑回 page 的长 context
@@ -194,6 +195,7 @@ func (s *SearchAction) applyFilters(ctx context.Context, filters []internalFilte
 	}
 
 	// 4. 依次点击每个筛选选项；每次都重新 hover + 重新查 panel/row/tag，避免句柄过期
+	anyClicked := false
 	for _, f := range filters {
 		if err := filterBtn.Hover(); err != nil {
 			return fmt.Errorf("%w: 重新悬停筛选按钮失败: %v", errors.ErrSelectorNotFound, err)
@@ -202,17 +204,50 @@ func (s *SearchAction) applyFilters(ctx context.Context, filters []internalFilte
 		if err != nil {
 			return fmt.Errorf("%w: 找不到筛选面板 div.filter-panel: %v", errors.ErrSelectorNotFound, err)
 		}
-		if err := clickFilterOption(page, panel, f.GroupLabel, f.OptionText); err != nil {
+		alreadyActive, err := clickFilterOption(page, panel, f.GroupLabel, f.OptionText)
+		if err != nil {
 			return err
+		}
+		if !alreadyActive {
+			anyClicked = true
 		}
 	}
 
-	// 5. 把鼠标移开筛选区，让 hover 触发的面板收起，触发"提交"。
+	// 5. 趁面板还开着，捕获一次"点击后"快照（仅做诊断用）。
+	//    日志里 after_active 能直接看到 click 是否让目标选项变成 active —— 这是
+	//    "click 触发 UI handler 没"的关键证据。
+	afterClick := captureSearchSnapshot(page)
+	logrus.WithFields(logrus.Fields{
+		"any_clicked":     anyClicked,
+		"initial_active":  initial.ActiveFilters,
+		"after_active":    afterClick.ActiveFilters,
+		"initial_url":     initial.URLSearch,
+		"after_url":       afterClick.URLSearch,
+		"after_fp_prefix": shortFp(afterClick.Fingerprint),
+	}).Info("filter click loop done; snapshot captured before panel close")
+
+	// 6. 把鼠标移开筛选区，让 hover 触发的面板收起，触发"提交"。
 	// 部分 UI 选项是 hover-保持+click 模型，关掉面板才会真正 apply。
 	closeFilterPanel(page)
 
-	// 6. 条件竞争：等待筛选生效或快速失败
+	// 7. 全部选项本来就已选中（典型：sort_by=综合 是默认值）→ 不需要等
+	//    也不需要报 timeout，直接当成功，让调用方拿到当前默认 feed。
+	if !anyClicked {
+		logrus.Info("all requested filters were already active; treating as no-op success")
+		return nil
+	}
+
+	// 8. 条件竞争：等待筛选生效或快速失败。基线是点击前的 initial，
+	//    任何 fingerprint / URL 变化都说明搜索 XHR 完成了。
 	return waitForFilterApplied(ctx, page, initial)
+}
+
+// shortFp 把超长 fingerprint 截短给日志用，避免一行刷屏。
+func shortFp(fp string) string {
+	if len(fp) <= 60 {
+		return fp
+	}
+	return fp[:60] + "...(truncated)"
 }
 
 // closeFilterPanel 把鼠标移到 (0,0)，关掉 hover 触发的筛选面板。
@@ -256,10 +291,14 @@ func openFilterPanel(page *rod.Page, filterBtn *rod.Element) error {
 }
 
 // clickFilterOption 在筛选面板内按文本定位筛选行 + 选项并点击。
-func clickFilterOption(page *rod.Page, panel *rod.Element, groupLabel, optionText string) error {
+//
+// 返回 alreadyActive=true 表示目标选项点击前就已经是 active/selected
+// 状态（典型：sort_by=综合 是默认值）。这种情况下没点也不需要等待，
+// 直接当成功。
+func clickFilterOption(page *rod.Page, panel *rod.Element, groupLabel, optionText string) (alreadyActive bool, err error) {
 	rows, err := panel.Elements(`div.filters`)
 	if err != nil || len(rows) == 0 {
-		return fmt.Errorf("%w: 筛选面板内没有筛选行 div.filters: %v", errors.ErrSelectorNotFound, err)
+		return false, fmt.Errorf("%w: 筛选面板内没有筛选行 div.filters: %v", errors.ErrSelectorNotFound, err)
 	}
 
 	for _, row := range rows {
@@ -269,7 +308,7 @@ func clickFilterOption(page *rod.Page, panel *rod.Element, groupLabel, optionTex
 		}
 		tags, err := row.Elements(`div.tags`)
 		if err != nil || len(tags) == 0 {
-			return fmt.Errorf("%w: 筛选组 %q 内没有选项 div.tags: %v", errors.ErrSelectorNotFound, groupLabel, err)
+			return false, fmt.Errorf("%w: 筛选组 %q 内没有选项 div.tags: %v", errors.ErrSelectorNotFound, groupLabel, err)
 		}
 		for _, tag := range tags {
 			t, _ := tag.Text()
@@ -278,11 +317,57 @@ func clickFilterOption(page *rod.Page, panel *rod.Element, groupLabel, optionTex
 			}
 			// 句柄重新绑回 page 的长 context，避免继承 discovery 的短超时
 			tag = tag.Context(page.GetContext())
-			return clickInteractable(tag, groupLabel, optionText)
+
+			// 点击前先看选项是不是已经选中。已经选中说明默认就是这个值，
+			// 没必要点也没必要等（不然 sort_by=综合 永远 timeout）。
+			beforeClass := elementClass(tag)
+			if isClassActive(beforeClass) {
+				logrus.WithFields(logrus.Fields{
+					"group": groupLabel, "option": optionText, "class": beforeClass,
+				}).Info("filter option already active; skipping click")
+				return true, nil
+			}
+
+			if err := clickInteractable(tag, groupLabel, optionText); err != nil {
+				return false, err
+			}
+
+			// 点击后立刻读 class，让 logs 能看到 click 是否触发了 UI handler。
+			// 如果 after_active=true 但后面 feed 没变 → click 只触发了 UI 层，
+			// 没触发搜索 XHR（很可能是 synthetic-event 被 isTrusted 检查滤掉）。
+			// 如果 after_active=false → click 根本没到目标元素的 handler。
+			afterClass := elementClass(tag)
+			logrus.WithFields(logrus.Fields{
+				"group":              groupLabel,
+				"option":             optionText,
+				"before_class":       beforeClass,
+				"after_class":        afterClass,
+				"active_after_click": isClassActive(afterClass),
+			}).Info("filter option clicked")
+
+			return false, nil
 		}
-		return fmt.Errorf("%w: 筛选组 %q 中未找到选项 %q", errors.ErrSelectorNotFound, groupLabel, optionText)
+		return false, fmt.Errorf("%w: 筛选组 %q 中未找到选项 %q", errors.ErrSelectorNotFound, groupLabel, optionText)
 	}
-	return fmt.Errorf("%w: 未找到筛选组 %q", errors.ErrSelectorNotFound, groupLabel)
+	return false, fmt.Errorf("%w: 未找到筛选组 %q", errors.ErrSelectorNotFound, groupLabel)
+}
+
+// elementClass 读 element 的 class 属性；空值或读取失败都返回 ""。
+func elementClass(el *rod.Element) string {
+	cls, err := el.Attribute("class")
+	if err != nil || cls == nil {
+		return ""
+	}
+	return *cls
+}
+
+// isClassActive 判断 class 字符串里是否含有 active / selected 标记。
+// XHS 用 .active / .selected / 包含 "active" / 包含 "selected" 几种写法都见过。
+func isClassActive(class string) bool {
+	if class == "" {
+		return false
+	}
+	return strings.Contains(class, "active") || strings.Contains(class, "selected")
 }
 
 // clickInteractable 用三层策略点击筛选选项。

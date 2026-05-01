@@ -5,6 +5,7 @@ import (
 	stderrors "errors"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -237,6 +238,38 @@ func TestFilterChanged(t *testing.T) {
 			require.Equal(t, c.want, filterChanged(base, c.cur))
 		})
 	}
+}
+
+func TestIsClassActive(t *testing.T) {
+	cases := []struct {
+		class string
+		want  bool
+	}{
+		{"", false},
+		{"tag", false},
+		{"tag normal", false},
+		{"tag active", true},
+		{"tag selected", true},
+		{"is-active", true},
+		{"is_selected", true},
+		{"item activeItem", true}, // 子串匹配
+		{"item is-active is-current", true},
+		{"normal tag-selected-1", true},
+	}
+	for _, c := range cases {
+		t.Run(c.class, func(t *testing.T) {
+			require.Equal(t, c.want, isClassActive(c.class))
+		})
+	}
+}
+
+func TestShortFp(t *testing.T) {
+	require.Equal(t, "", shortFp(""))
+	require.Equal(t, "abc", shortFp("abc"))
+	long := strings.Repeat("a", 60)
+	require.Equal(t, long, shortFp(long))
+	long61 := strings.Repeat("a", 61)
+	require.Equal(t, strings.Repeat("a", 60)+"...(truncated)", shortFp(long61))
 }
 
 func TestActiveFiltersOnlyChanged(t *testing.T) {
