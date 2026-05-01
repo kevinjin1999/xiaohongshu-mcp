@@ -414,16 +414,27 @@ func waitForFilterApplied(ctx context.Context, page *rod.Page, initial searchSna
 		}
 
 		if time.Now().After(deadline) {
-			logrus.WithFields(logrus.Fields{
-				"initial_fp":      initial.Fingerprint,
-				"current_fp":      cur.Fingerprint,
-				"initial_url":     initial.URLSearch,
-				"current_url":     cur.URLSearch,
-				"initial_active":  initial.ActiveFilters,
-				"current_active":  cur.ActiveFilters,
-				"state":           cur.State,
-				"feeds_len_match": cur.Fingerprint != "" && cur.Fingerprint == initial.Fingerprint,
-			}).Warn("search filter apply timed out (no signal changed)")
+			fields := logrus.Fields{
+				"initial_fp":     initial.Fingerprint,
+				"current_fp":     cur.Fingerprint,
+				"initial_url":    initial.URLSearch,
+				"current_url":    cur.URLSearch,
+				"initial_active": initial.ActiveFilters,
+				"current_active": cur.ActiveFilters,
+				"state":          cur.State,
+			}
+			if activeFiltersOnlyChanged(initial, cur) {
+				// click 让 UI 选中状态变了，但 feed 列表 / URL 都没刷新。
+				// 通常是 JS dispatchEvent 的 isTrusted=false 被 XHS 真实搜索 XHR
+				// 过滤掉，只触发了纯前端 UI 更新。返回 timeout（而不是当成功）
+				// 是 issue #3 的核心修复点，避免静默返回旧的"综合"结果。
+				logrus.WithFields(fields).Warn(
+					"filter timeout: only UI active state changed, " +
+						"feed list / URL not refreshed (likely synthetic-event被忽略)",
+				)
+			} else {
+				logrus.WithFields(fields).Warn("search filter apply timed out (no signal changed)")
+			}
 			return errors.ErrFilterTimeout
 		}
 
@@ -441,7 +452,21 @@ func pageHas(page *rod.Page, selector string) bool {
 	return has
 }
 
-// filterChanged 用多信号 OR 判断筛选是否生效。任意一个维度变化都算。
+// filterChanged 判断筛选是否真的生效。
+//
+// **重要**：ActiveFilters（DOM 里 .active/.selected 的变化）单独不算成功信号。
+// XHS 的 click handler 会立刻把目标选项 mark 成 active（UI 状态），但是真正
+// 触发搜索 XHR / 改写 __INITIAL_STATE__.search.feeds 是更晚一点。如果只看
+// ActiveFilters 就返回，会在 feed 列表还没刷新前就退出，调用方拿到的还是
+// 旧的"综合"结果（issue #3）。
+//
+// 因此只接受能直接反映 feed 列表已经更新的信号：
+//  1. Fingerprint（feeds 全量 id 拼接）变化
+//  2. URLSearch（location.search）变化 —— XHS 部分版本会把 sort= 写进 query，
+//     这只有在搜索 XHR 完成后才会发生
+//
+// ActiveFilters 仅用于诊断（区分"click 没生效" vs "click 触发了 UI 但 feed
+// 还没刷新"）。
 func filterChanged(initial, cur searchSnapshot) bool {
 	if cur.Fingerprint != "" && cur.Fingerprint != initial.Fingerprint {
 		return true
@@ -449,10 +474,24 @@ func filterChanged(initial, cur searchSnapshot) bool {
 	if cur.URLSearch != "" && cur.URLSearch != initial.URLSearch {
 		return true
 	}
-	if cur.ActiveFilters != initial.ActiveFilters {
-		return true
-	}
 	return false
+}
+
+// activeFiltersOnlyChanged 用于诊断：UI 选中状态变了，但 feed 列表 / URL
+// 都没变。命中这种情况说明 click 触发了 UI handler 但没触发实际的搜索请求
+// （例如 JS dispatchEvent 的 isTrusted=false 被 XHS 滤掉），需要 timeout
+// 而不是当成功。
+func activeFiltersOnlyChanged(initial, cur searchSnapshot) bool {
+	if cur.ActiveFilters == initial.ActiveFilters {
+		return false
+	}
+	if cur.Fingerprint != "" && cur.Fingerprint != initial.Fingerprint {
+		return false
+	}
+	if cur.URLSearch != "" && cur.URLSearch != initial.URLSearch {
+		return false
+	}
+	return true
 }
 
 // extractFeedsFromPage 读取 __INITIAL_STATE__ 中的 feeds 列表。

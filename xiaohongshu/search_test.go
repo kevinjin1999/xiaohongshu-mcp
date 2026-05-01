@@ -210,9 +210,11 @@ func TestFilterChanged(t *testing.T) {
 			true,
 		},
 		{
-			"active filter 变化",
+			// 回归：issue #3 — UI 选中状态变化不能算成功，否则会在 feed 还没刷新前
+			// 就静默返回旧的"综合"结果。
+			"仅 active filter 变化 → 不算变化",
 			searchSnapshot{State: stateFeeds, Fingerprint: base.Fingerprint, URLSearch: base.URLSearch, ActiveFilters: "最多点赞"},
-			true,
+			false,
 		},
 		{
 			"fingerprint 为空不算变化",
@@ -224,10 +226,55 @@ func TestFilterChanged(t *testing.T) {
 			searchSnapshot{State: stateFeeds, Fingerprint: base.Fingerprint, URLSearch: "", ActiveFilters: base.ActiveFilters},
 			false,
 		},
+		{
+			"active 变 + fingerprint 变 → 算变化",
+			searchSnapshot{State: stateFeeds, Fingerprint: "22:a,b,d", URLSearch: base.URLSearch, ActiveFilters: "最多点赞"},
+			true,
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			require.Equal(t, c.want, filterChanged(base, c.cur))
+		})
+	}
+}
+
+func TestActiveFiltersOnlyChanged(t *testing.T) {
+	base := searchSnapshot{
+		State: stateFeeds, Fingerprint: "22:a,b,c", URLSearch: "?keyword=x", ActiveFilters: "",
+	}
+
+	cases := []struct {
+		name string
+		cur  searchSnapshot
+		want bool
+	}{
+		{
+			// issue #3 的核心场景：click 让 UI 选中了，但搜索 XHR 没发，
+			// __INITIAL_STATE__.search.feeds 还是旧的，URL 也没变。
+			"只 active filter 变 → 命中诊断条件",
+			searchSnapshot{State: stateFeeds, Fingerprint: base.Fingerprint, URLSearch: base.URLSearch, ActiveFilters: "最多点赞"},
+			true,
+		},
+		{
+			"active + fingerprint 都变 → 不命中（是真成功）",
+			searchSnapshot{State: stateFeeds, Fingerprint: "22:a,b,d", URLSearch: base.URLSearch, ActiveFilters: "最多点赞"},
+			false,
+		},
+		{
+			"active + URL 都变 → 不命中",
+			searchSnapshot{State: stateFeeds, Fingerprint: base.Fingerprint, URLSearch: "?keyword=x&sort=hot", ActiveFilters: "最多点赞"},
+			false,
+		},
+		{
+			"active 没变 → 不命中（是其他失败原因）",
+			searchSnapshot{State: stateFeeds, Fingerprint: base.Fingerprint, URLSearch: base.URLSearch, ActiveFilters: base.ActiveFilters},
+			false,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			require.Equal(t, c.want, activeFiltersOnlyChanged(base, c.cur))
 		})
 	}
 }
