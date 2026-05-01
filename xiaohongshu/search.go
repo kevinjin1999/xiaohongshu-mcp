@@ -131,16 +131,44 @@ const (
 	// XHS 切换排序时会先把 feeds 数组清空（loading），再用 XHR 结果回填，
 	// 第一次 poll 经常恰好踩在清空瞬间。给 5s 让新数据回填。
 	filterEmptyStateGrace = 5 * time.Second
+	// 单次 page.Navigate 预算。XHS 网络偶尔抖动，给到 30s 就够了。
+	searchNavigateBudget = 30 * time.Second
+	// DOM 稳定等待预算。XHS 有持续的 analytics / heartbeat polling，
+	// 用 WaitStable（兼看 network）会永远不稳。改成 WaitDOMStable 只看 DOM，
+	// 并且即使超时也只是日志告警继续走，不卡死整个请求 (issue #3 后续报告里
+	// 5min 整个 search_feeds 不返回的根因)。
+	searchDOMStableBudget = 15 * time.Second
+	// 等 __INITIAL_STATE__ 出现的预算。脚本注入是 XHS SSR 后立刻完成，
+	// 通常 ~1s 内就到；超过 15s 还没出来基本就是页面被 block 了。
+	searchStateReadyBudget = 15 * time.Second
 )
 
 func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...FilterOption) ([]Feed, error) {
 	page := s.page.Context(ctx)
 
 	searchURL := makeSearchURL(keyword)
-	page.MustNavigate(searchURL)
-	page.MustWaitStable()
 
-	page.MustWait(`() => window.__INITIAL_STATE__ !== undefined`)
+	// 1. 导航：30s 预算。XHS 偶尔慢，但 5min 那种 hang 是 unacceptable。
+	logrus.WithField("keyword", keyword).Info("search: navigating")
+	if err := page.Timeout(searchNavigateBudget).Navigate(searchURL); err != nil {
+		return nil, fmt.Errorf("search navigate %q failed: %w", keyword, err)
+	}
+
+	// 2. DOM 稳定等待：替代之前的 MustWaitStable。
+	//    MustWaitStable 同时等 DOM + network，XHS 有持续 analytics / heartbeat
+	//    polling，network 永远不稳，整个请求会 hang 住（issue #3 后续报告里
+	//    5min 不返回的根因）。改 WaitDOMStable 只看 DOM；超时也只是 Warn，
+	//    不阻断后续 __INITIAL_STATE__ 等待。
+	logrus.Info("search: waiting DOM stable")
+	if err := page.Timeout(searchDOMStableBudget).WaitDOMStable(500*time.Millisecond, 0); err != nil {
+		logrus.WithError(err).Warn("search: WaitDOMStable did not complete in budget; proceeding")
+	}
+
+	// 3. __INITIAL_STATE__ 就绪：bounded，不让单步无限等。
+	logrus.Info("search: waiting __INITIAL_STATE__")
+	if err := page.Timeout(searchStateReadyBudget).Wait(rod.Eval(`() => window.__INITIAL_STATE__ !== undefined`)); err != nil {
+		return nil, fmt.Errorf("__INITIAL_STATE__ not ready in %s: %w", searchStateReadyBudget, err)
+	}
 
 	if len(filters) > 0 {
 		// 转换并校验所有筛选选项
