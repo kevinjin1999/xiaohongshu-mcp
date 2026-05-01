@@ -358,12 +358,32 @@ func clickFilterTagWithStrategies(tag *rod.Element, groupLabel, optionText strin
 	// 一开始就 dump 一次 DOM 结构 (Debug 级)，方便不熟悉的 XHS 变体定位。
 	logrus.WithFields(captureTagShape(tag)).Debug("filter tag pre-click shape")
 
+	page := tag.Page()
+
 	type strategy struct {
 		name string
 		fn   func() error
 	}
 
 	strategies := []strategy{
+		{
+			// 关键策略：跳过 panel.Elements('div.tags') 找到的隐藏 ghost 元素
+			// (XHS 部分版本: opacity:1e-05 + aria-hidden + zIndex:-1)，直接 JS
+			// 找可见的、文本相同的元素，拿坐标后用 CDP 真实鼠标点击。
+			// 实测当 div.tags 是 ghost 时，elementFromPoint 返回的 SPAN 才是
+			// 真正绑了 onClick 的目标。
+			name: "visible-coords-cdp",
+			fn: func() error {
+				pt, err := findVisibleFilterCoords(page, groupLabel, optionText)
+				if err != nil {
+					return err
+				}
+				if err := page.Mouse.MoveTo(pt); err != nil {
+					return err
+				}
+				return page.Mouse.Click(proto.InputMouseButtonLeft, 1)
+			},
+		},
 		{
 			name: "rod-direct",
 			fn:   func() error { return clickInteractable(tag, groupLabel, optionText) },
@@ -379,9 +399,39 @@ func clickFilterTagWithStrategies(tag *rod.Element, groupLabel, optionText strin
 			},
 		},
 		{
+			// 直接对元素 JS this.click()，绕开屏幕坐标 / hit-testing。
+			// 如果 onClick 真的绑在 div.tags 上（即使它是 hidden ghost），这能触发。
+			name: "js-this-click",
+			fn: func() error {
+				_, err := tag.Eval(`() => { this.click(); return true; }`)
+				return err
+			},
+		},
+		{
 			name: "js-element-from-point",
 			fn:   func() error { return clickViaElementFromPoint(tag) },
 		},
+	}
+
+	verify := func() bool {
+		// 自身 class 变 active，或 DOM 里任何可见元素的 active class 文本匹配
+		// （用于 visible-coords-cdp 这种点的不是 tag 的策略）。
+		if isClassActive(elementClass(tag)) {
+			return true
+		}
+		return anyActiveOptionEquals(page, optionText)
+	}
+	verifyWithBudget := func(budget time.Duration) bool {
+		deadline := time.Now().Add(budget)
+		for {
+			if verify() {
+				return true
+			}
+			if time.Now().After(deadline) {
+				return false
+			}
+			time.Sleep(classActivePollInterval)
+		}
 	}
 
 	for _, s := range strategies {
@@ -391,8 +441,9 @@ func clickFilterTagWithStrategies(tag *rod.Element, groupLabel, optionText strin
 			}).Warn("click strategy failed; trying next")
 			continue
 		}
-		// 等 class 真的变成 active；2s 内不变就当作没生效，进下一个策略
-		if waitForClassActive(tag, classActivePollBudget) {
+		// 等 class 真的变成 active（自身或 DOM 里同名 active 选项）；
+		// 2s 内不变就当作没生效，进下一个策略
+		if verifyWithBudget(classActivePollBudget) {
 			logrus.WithFields(logrus.Fields{
 				"group": groupLabel, "option": optionText, "strategy": s.name,
 				"after_class": elementClass(tag),
@@ -402,13 +453,130 @@ func clickFilterTagWithStrategies(tag *rod.Element, groupLabel, optionText strin
 		logrus.WithFields(logrus.Fields{
 			"group": groupLabel, "option": optionText, "strategy": s.name,
 			"after_class": elementClass(tag),
-		}).Warn("click strategy returned ok but class did not activate within budget")
+		}).Warn("click strategy returned ok but option did not activate within budget")
 	}
 
 	// 全部失败：dump DOM 现场（含 elementFromPoint），让用户能定位真实点击目标
 	logClickDiagnostics(tag, groupLabel, optionText)
 	return false, fmt.Errorf("%w: 选项 %q/%q 多种点击策略均未激活, class 仍是 %q",
 		errors.ErrFilterClickFailed, groupLabel, optionText, elementClass(tag))
+}
+
+// findVisibleFilterCoords 在 filter 相关的 DOM 里找一个文本严格匹配 optionText
+// 的"可见"元素，返回其中心坐标。
+//
+// 可见 = display!=none && visibility!=hidden && opacity>=0.5 && aria-hidden!=true。
+// 这样能跳过 XHS 渲染的 hidden ghost div.tags（opacity:1e-05 + aria-hidden）。
+//
+// "文本严格匹配 optionText" 用 directText（只看自己的 text node，不递归子元素），
+// 避免父级容器把所有选项文本都串在一起匹配。
+func findVisibleFilterCoords(page *rod.Page, groupLabel, optionText string) (proto.Point, error) {
+	res, err := page.Eval(`(group, option) => {
+		const visible = el => {
+			if (!el || !el.getBoundingClientRect) return false;
+			const cs = window.getComputedStyle(el);
+			if (cs.display === 'none') return false;
+			if (cs.visibility === 'hidden') return false;
+			if (parseFloat(cs.opacity) < 0.5) return false;
+			if (el.getAttribute('aria-hidden') === 'true') return false;
+			return true;
+		};
+		const directText = el => {
+			return Array.from(el.childNodes)
+				.filter(n => n.nodeType === 3)
+				.map(n => n.textContent.trim())
+				.join('').trim();
+		};
+		// XHS 不同变体里 panel 类名可能不同，只要包含 "filter" 就一起搜
+		const candidates = document.querySelectorAll(
+			'div.filter-panel *, [class*="filter-panel"] *, [class*="filter"] *'
+		);
+		let best = null;
+		let bestArea = Infinity;
+		for (const el of candidates) {
+			if (!visible(el)) continue;
+			if (directText(el) !== option) continue;
+			const r = el.getBoundingClientRect();
+			const area = r.width * r.height;
+			if (area <= 0) continue;
+			if (area < bestArea) {
+				bestArea = area;
+				best = { el, r };
+			}
+		}
+		if (!best) return JSON.stringify({ found: false });
+		return JSON.stringify({
+			found: true,
+			x: best.r.left + best.r.width / 2,
+			y: best.r.top + best.r.height / 2,
+			tag: best.el.tagName,
+			cls: best.el.className,
+			html: (best.el.outerHTML || '').slice(0, 200),
+		});
+	}`, groupLabel, optionText)
+
+	if err != nil {
+		return proto.Point{}, err
+	}
+	raw := ""
+	if res != nil {
+		raw = res.Value.Str()
+	}
+	if raw == "" {
+		return proto.Point{}, fmt.Errorf("eval returned empty for visible filter coords")
+	}
+	var info struct {
+		Found bool    `json:"found"`
+		X     float64 `json:"x"`
+		Y     float64 `json:"y"`
+		Tag   string  `json:"tag"`
+		Cls   string  `json:"cls"`
+		HTML  string  `json:"html"`
+	}
+	if err := json.Unmarshal([]byte(raw), &info); err != nil {
+		return proto.Point{}, fmt.Errorf("parse visible coords: %w (raw=%s)", err, raw)
+	}
+	if !info.Found {
+		return proto.Point{}, fmt.Errorf("no visible element with directText==%q in filter-related panels", optionText)
+	}
+	logrus.WithFields(logrus.Fields{
+		"group":  groupLabel,
+		"option": optionText,
+		"target": info.Tag + "." + info.Cls,
+		"html":   info.HTML,
+		"x":      info.X,
+		"y":      info.Y,
+	}).Info("found visible filter target via text match")
+	return proto.Point{X: info.X, Y: info.Y}, nil
+}
+
+// anyActiveOptionEquals 判断当前 DOM 里任何可见 .active/.selected 元素的
+// 文本是否等于 optionText。用于"自身没变 active 但其他可见元素变了"的场景
+// （典型：visible-coords-cdp 点的不是我们持有的 tag）。
+func anyActiveOptionEquals(page *rod.Page, optionText string) bool {
+	res, err := page.Eval(`(option) => {
+		const visible = el => {
+			const cs = window.getComputedStyle(el);
+			if (cs.display === 'none') return false;
+			if (cs.visibility === 'hidden') return false;
+			if (parseFloat(cs.opacity) < 0.5) return false;
+			if (el.getAttribute('aria-hidden') === 'true') return false;
+			return true;
+		};
+		const candidates = document.querySelectorAll(
+			'.active, .selected, [class*="active"], [class*="selected"]'
+		);
+		for (const el of candidates) {
+			if (!visible(el)) continue;
+			const t = (el.textContent || '').trim();
+			if (t === option) return true;
+		}
+		return false;
+	}`, optionText)
+	if err != nil || res == nil {
+		return false
+	}
+	return res.Value.Bool()
 }
 
 // waitForClassActive poll element 的 class 直到含 active/selected 或超时。
