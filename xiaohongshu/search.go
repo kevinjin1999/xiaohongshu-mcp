@@ -119,20 +119,56 @@ const (
 	// 面板打开 / hover 后等待动画 (fade-in/slide) 稳定的小延迟。
 	// 没有它，rod 的 WaitInteractable "is on top" 检查会在动画期间误判。
 	filterPanelSettleDelay = 400 * time.Millisecond
+	// 单次 click 后 poll active class 的预算。click 即使触发了 reactive
+	// 更新也不一定立刻见效，给 2s 让 Vue/React 渲染 reactive 状态。
+	classActivePollBudget   = 2 * time.Second
+	classActivePollInterval = 100 * time.Millisecond
 	// 整个筛选生效的总预算，issue 要求 15-30s 内必须给出结论。
 	filterApplyTimeout = 25 * time.Second
 	// 筛选生效轮询间隔。
 	filterPollInterval = 250 * time.Millisecond
+	// 看到 __INITIAL_STATE__.search.feeds = [] 时不要立刻当 ErrEmptyResult。
+	// XHS 切换排序时会先把 feeds 数组清空（loading），再用 XHR 结果回填，
+	// 第一次 poll 经常恰好踩在清空瞬间。给 5s 让新数据回填。
+	filterEmptyStateGrace = 5 * time.Second
+	// 单次 page.Navigate 预算。XHS 网络偶尔抖动，给到 30s 就够了。
+	searchNavigateBudget = 30 * time.Second
+	// DOM 稳定等待预算。XHS 有持续的 analytics / heartbeat polling，
+	// 用 WaitStable（兼看 network）会永远不稳。改成 WaitDOMStable 只看 DOM，
+	// 并且即使超时也只是日志告警继续走，不卡死整个请求 (issue #3 后续报告里
+	// 5min 整个 search_feeds 不返回的根因)。
+	searchDOMStableBudget = 15 * time.Second
+	// 等 __INITIAL_STATE__ 出现的预算。脚本注入是 XHS SSR 后立刻完成，
+	// 通常 ~1s 内就到；超过 15s 还没出来基本就是页面被 block 了。
+	searchStateReadyBudget = 15 * time.Second
 )
 
 func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...FilterOption) ([]Feed, error) {
 	page := s.page.Context(ctx)
 
 	searchURL := makeSearchURL(keyword)
-	page.MustNavigate(searchURL)
-	page.MustWaitStable()
 
-	page.MustWait(`() => window.__INITIAL_STATE__ !== undefined`)
+	// 1. 导航：30s 预算。XHS 偶尔慢，但 5min 那种 hang 是 unacceptable。
+	logrus.WithField("keyword", keyword).Info("search: navigating")
+	if err := page.Timeout(searchNavigateBudget).Navigate(searchURL); err != nil {
+		return nil, fmt.Errorf("search navigate %q failed: %w", keyword, err)
+	}
+
+	// 2. DOM 稳定等待：替代之前的 MustWaitStable。
+	//    MustWaitStable 同时等 DOM + network，XHS 有持续 analytics / heartbeat
+	//    polling，network 永远不稳，整个请求会 hang 住（issue #3 后续报告里
+	//    5min 不返回的根因）。改 WaitDOMStable 只看 DOM；超时也只是 Warn，
+	//    不阻断后续 __INITIAL_STATE__ 等待。
+	logrus.Info("search: waiting DOM stable")
+	if err := page.Timeout(searchDOMStableBudget).WaitDOMStable(500*time.Millisecond, 0); err != nil {
+		logrus.WithError(err).Warn("search: WaitDOMStable did not complete in budget; proceeding")
+	}
+
+	// 3. __INITIAL_STATE__ 就绪：bounded，不让单步无限等。
+	logrus.Info("search: waiting __INITIAL_STATE__")
+	if err := page.Timeout(searchStateReadyBudget).Wait(rod.Eval(`() => window.__INITIAL_STATE__ !== undefined`)); err != nil {
+		return nil, fmt.Errorf("__INITIAL_STATE__ not ready in %s: %w", searchStateReadyBudget, err)
+	}
 
 	if len(filters) > 0 {
 		// 转换并校验所有筛选选项
@@ -179,7 +215,8 @@ func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...Fi
 func (s *SearchAction) applyFilters(ctx context.Context, filters []internalFilterOption) error {
 	page := s.page.Context(ctx)
 
-	// 1. 点击前先快照当前 feed，用于检测筛选生效
+	// 1. 点击前先快照当前 feed（fingerprint/url），后面 wait 阶段用它对比。
+	//    ActiveFilters 这里都是空的，因为面板还没打开。
 	initial := captureSearchSnapshot(page)
 
 	// 2. 短超时找筛选按钮，但句柄绑回 page 的长 context
@@ -194,6 +231,7 @@ func (s *SearchAction) applyFilters(ctx context.Context, filters []internalFilte
 	}
 
 	// 4. 依次点击每个筛选选项；每次都重新 hover + 重新查 panel/row/tag，避免句柄过期
+	anyClicked := false
 	for _, f := range filters {
 		if err := filterBtn.Hover(); err != nil {
 			return fmt.Errorf("%w: 重新悬停筛选按钮失败: %v", errors.ErrSelectorNotFound, err)
@@ -202,17 +240,50 @@ func (s *SearchAction) applyFilters(ctx context.Context, filters []internalFilte
 		if err != nil {
 			return fmt.Errorf("%w: 找不到筛选面板 div.filter-panel: %v", errors.ErrSelectorNotFound, err)
 		}
-		if err := clickFilterOption(page, panel, f.GroupLabel, f.OptionText); err != nil {
+		alreadyActive, err := clickFilterOption(page, panel, f.GroupLabel, f.OptionText)
+		if err != nil {
 			return err
+		}
+		if !alreadyActive {
+			anyClicked = true
 		}
 	}
 
-	// 5. 把鼠标移开筛选区，让 hover 触发的面板收起，触发"提交"。
+	// 5. 趁面板还开着，捕获一次"点击后"快照（仅做诊断用）。
+	//    日志里 after_active 能直接看到 click 是否让目标选项变成 active —— 这是
+	//    "click 触发 UI handler 没"的关键证据。
+	afterClick := captureSearchSnapshot(page)
+	logrus.WithFields(logrus.Fields{
+		"any_clicked":     anyClicked,
+		"initial_active":  initial.ActiveFilters,
+		"after_active":    afterClick.ActiveFilters,
+		"initial_url":     initial.URLSearch,
+		"after_url":       afterClick.URLSearch,
+		"after_fp_prefix": shortFp(afterClick.Fingerprint),
+	}).Info("filter click loop done; snapshot captured before panel close")
+
+	// 6. 把鼠标移开筛选区，让 hover 触发的面板收起，触发"提交"。
 	// 部分 UI 选项是 hover-保持+click 模型，关掉面板才会真正 apply。
 	closeFilterPanel(page)
 
-	// 6. 条件竞争：等待筛选生效或快速失败
+	// 7. 全部选项本来就已选中（典型：sort_by=综合 是默认值）→ 不需要等
+	//    也不需要报 timeout，直接当成功，让调用方拿到当前默认 feed。
+	if !anyClicked {
+		logrus.Info("all requested filters were already active; treating as no-op success")
+		return nil
+	}
+
+	// 8. 条件竞争：等待筛选生效或快速失败。基线是点击前的 initial，
+	//    任何 fingerprint / URL 变化都说明搜索 XHR 完成了。
 	return waitForFilterApplied(ctx, page, initial)
+}
+
+// shortFp 把超长 fingerprint 截短给日志用，避免一行刷屏。
+func shortFp(fp string) string {
+	if len(fp) <= 60 {
+		return fp
+	}
+	return fp[:60] + "...(truncated)"
 }
 
 // closeFilterPanel 把鼠标移到 (0,0)，关掉 hover 触发的筛选面板。
@@ -255,11 +326,21 @@ func openFilterPanel(page *rod.Page, filterBtn *rod.Element) error {
 	return nil
 }
 
-// clickFilterOption 在筛选面板内按文本定位筛选行 + 选项并点击。
-func clickFilterOption(page *rod.Page, panel *rod.Element, groupLabel, optionText string) error {
+// clickFilterOption 在筛选面板内按文本定位筛选行 + 选项并点击，并验证选项
+// 真的进入了 active 状态。
+//
+// 返回 alreadyActive=true 表示目标选项点击前就已经是 active/selected
+// 状态（典型：sort_by=综合 是默认值）。这种情况下没点也不需要等待，
+// 直接当成功。
+//
+// 多策略点击：实测 XHS 部分版本里 `div.tags` 上没绑 onClick handler，
+// 真实 click 落在 `div.tags` 上不会触发任何 UI / XHR。所以一次 click 后
+// 不立刻成功就要换更深 / 更宽的目标再试一次。每次 click 后 polling
+// 检查 active class，2s 内变成 active 即认定成功。
+func clickFilterOption(page *rod.Page, panel *rod.Element, groupLabel, optionText string) (alreadyActive bool, err error) {
 	rows, err := panel.Elements(`div.filters`)
 	if err != nil || len(rows) == 0 {
-		return fmt.Errorf("%w: 筛选面板内没有筛选行 div.filters: %v", errors.ErrSelectorNotFound, err)
+		return false, fmt.Errorf("%w: 筛选面板内没有筛选行 div.filters: %v", errors.ErrSelectorNotFound, err)
 	}
 
 	for _, row := range rows {
@@ -269,7 +350,7 @@ func clickFilterOption(page *rod.Page, panel *rod.Element, groupLabel, optionTex
 		}
 		tags, err := row.Elements(`div.tags`)
 		if err != nil || len(tags) == 0 {
-			return fmt.Errorf("%w: 筛选组 %q 内没有选项 div.tags: %v", errors.ErrSelectorNotFound, groupLabel, err)
+			return false, fmt.Errorf("%w: 筛选组 %q 内没有选项 div.tags: %v", errors.ErrSelectorNotFound, groupLabel, err)
 		}
 		for _, tag := range tags {
 			t, _ := tag.Text()
@@ -278,11 +359,323 @@ func clickFilterOption(page *rod.Page, panel *rod.Element, groupLabel, optionTex
 			}
 			// 句柄重新绑回 page 的长 context，避免继承 discovery 的短超时
 			tag = tag.Context(page.GetContext())
-			return clickInteractable(tag, groupLabel, optionText)
+			return clickFilterTagWithStrategies(tag, groupLabel, optionText)
 		}
-		return fmt.Errorf("%w: 筛选组 %q 中未找到选项 %q", errors.ErrSelectorNotFound, groupLabel, optionText)
+		return false, fmt.Errorf("%w: 筛选组 %q 中未找到选项 %q", errors.ErrSelectorNotFound, groupLabel, optionText)
 	}
-	return fmt.Errorf("%w: 未找到筛选组 %q", errors.ErrSelectorNotFound, groupLabel)
+	return false, fmt.Errorf("%w: 未找到筛选组 %q", errors.ErrSelectorNotFound, groupLabel)
+}
+
+// clickFilterTagWithStrategies 对找到的 tag 元素尝试多种 click 策略。
+// 返回 alreadyActive=true 表示进来时就已经是激活态。
+//
+// 策略链：
+//  1. rod 真实鼠标点击 div.tags 自身（覆盖大多数 XHS UI 版本）
+//  2. rod 真实鼠标点击 div.tags 的第一个后代元素（XHS 把 handler 绑在
+//     <span class="tag-name"> 这种内层元素的版本）
+//  3. JS 在中心点 dispatch click（最后的兜底，trust 不一定够，但偶尔有用）
+//
+// 每次 click 后 poll 2s 检查 class 是否变成 active；一旦命中立即返回成功。
+// 全部失败 → 输出 DOM 现场（outerHTML / 子元素 / elementFromPoint）+ 返回
+// `ErrFilterClickFailed`，不再让外层多等 25s 退 `filter_timeout`。
+func clickFilterTagWithStrategies(tag *rod.Element, groupLabel, optionText string) (bool, error) {
+	beforeClass := elementClass(tag)
+	if isClassActive(beforeClass) {
+		logrus.WithFields(logrus.Fields{
+			"group": groupLabel, "option": optionText, "class": beforeClass,
+		}).Info("filter option already active; skipping click")
+		return true, nil
+	}
+
+	// 一开始就 dump 一次 DOM 结构 (Debug 级)，方便不熟悉的 XHS 变体定位。
+	logrus.WithFields(captureTagShape(tag)).Debug("filter tag pre-click shape")
+
+	page := tag.Page()
+
+	type strategy struct {
+		name string
+		fn   func() error
+	}
+
+	strategies := []strategy{
+		{
+			// 关键策略：跳过 panel.Elements('div.tags') 找到的隐藏 ghost 元素
+			// (XHS 部分版本: opacity:1e-05 + aria-hidden + zIndex:-1)，直接 JS
+			// 找可见的、文本相同的元素，拿坐标后用 CDP 真实鼠标点击。
+			// 实测当 div.tags 是 ghost 时，elementFromPoint 返回的 SPAN 才是
+			// 真正绑了 onClick 的目标。
+			name: "visible-coords-cdp",
+			fn: func() error {
+				pt, err := findVisibleFilterCoords(page, groupLabel, optionText)
+				if err != nil {
+					return err
+				}
+				if err := page.Mouse.MoveTo(pt); err != nil {
+					return err
+				}
+				return page.Mouse.Click(proto.InputMouseButtonLeft, 1)
+			},
+		},
+		{
+			name: "rod-direct",
+			fn:   func() error { return clickInteractable(tag, groupLabel, optionText) },
+		},
+		{
+			name: "rod-first-child",
+			fn: func() error {
+				children, err := tag.Elements(`*`)
+				if err != nil || len(children) == 0 {
+					return fmt.Errorf("no descendants under div.tags: %v", err)
+				}
+				return clickInteractable(children[0], groupLabel, optionText)
+			},
+		},
+		{
+			// 直接对元素 JS this.click()，绕开屏幕坐标 / hit-testing。
+			// 如果 onClick 真的绑在 div.tags 上（即使它是 hidden ghost），这能触发。
+			name: "js-this-click",
+			fn: func() error {
+				_, err := tag.Eval(`() => { this.click(); return true; }`)
+				return err
+			},
+		},
+		{
+			name: "js-element-from-point",
+			fn:   func() error { return clickViaElementFromPoint(tag) },
+		},
+	}
+
+	verify := func() bool {
+		// 自身 class 变 active，或 DOM 里任何可见元素的 active class 文本匹配
+		// （用于 visible-coords-cdp 这种点的不是 tag 的策略）。
+		if isClassActive(elementClass(tag)) {
+			return true
+		}
+		return anyActiveOptionEquals(page, optionText)
+	}
+	verifyWithBudget := func(budget time.Duration) bool {
+		deadline := time.Now().Add(budget)
+		for {
+			if verify() {
+				return true
+			}
+			if time.Now().After(deadline) {
+				return false
+			}
+			time.Sleep(classActivePollInterval)
+		}
+	}
+
+	for _, s := range strategies {
+		if err := s.fn(); err != nil {
+			logrus.WithFields(logrus.Fields{
+				"group": groupLabel, "option": optionText, "strategy": s.name, "err": err,
+			}).Warn("click strategy failed; trying next")
+			continue
+		}
+		// 等 class 真的变成 active（自身或 DOM 里同名 active 选项）；
+		// 2s 内不变就当作没生效，进下一个策略
+		if verifyWithBudget(classActivePollBudget) {
+			logrus.WithFields(logrus.Fields{
+				"group": groupLabel, "option": optionText, "strategy": s.name,
+				"after_class": elementClass(tag),
+			}).Info("filter option clicked & activated")
+			return false, nil
+		}
+		logrus.WithFields(logrus.Fields{
+			"group": groupLabel, "option": optionText, "strategy": s.name,
+			"after_class": elementClass(tag),
+		}).Warn("click strategy returned ok but option did not activate within budget")
+	}
+
+	// 全部失败：dump DOM 现场（含 elementFromPoint），让用户能定位真实点击目标
+	logClickDiagnostics(tag, groupLabel, optionText)
+	return false, fmt.Errorf("%w: 选项 %q/%q 多种点击策略均未激活, class 仍是 %q",
+		errors.ErrFilterClickFailed, groupLabel, optionText, elementClass(tag))
+}
+
+// findVisibleFilterCoords 在 filter 相关的 DOM 里找一个文本严格匹配 optionText
+// 的"可见"元素，返回其中心坐标。
+//
+// 可见 = display!=none && visibility!=hidden && opacity>=0.5 && aria-hidden!=true。
+// 这样能跳过 XHS 渲染的 hidden ghost div.tags（opacity:1e-05 + aria-hidden）。
+//
+// "文本严格匹配 optionText" 用 directText（只看自己的 text node，不递归子元素），
+// 避免父级容器把所有选项文本都串在一起匹配。
+func findVisibleFilterCoords(page *rod.Page, groupLabel, optionText string) (proto.Point, error) {
+	res, err := page.Eval(`(group, option) => {
+		const visible = el => {
+			if (!el || !el.getBoundingClientRect) return false;
+			const cs = window.getComputedStyle(el);
+			if (cs.display === 'none') return false;
+			if (cs.visibility === 'hidden') return false;
+			if (parseFloat(cs.opacity) < 0.5) return false;
+			if (el.getAttribute('aria-hidden') === 'true') return false;
+			return true;
+		};
+		const directText = el => {
+			return Array.from(el.childNodes)
+				.filter(n => n.nodeType === 3)
+				.map(n => n.textContent.trim())
+				.join('').trim();
+		};
+		// XHS 不同变体里 panel 类名可能不同，只要包含 "filter" 就一起搜
+		const candidates = document.querySelectorAll(
+			'div.filter-panel *, [class*="filter-panel"] *, [class*="filter"] *'
+		);
+		let best = null;
+		let bestArea = Infinity;
+		for (const el of candidates) {
+			if (!visible(el)) continue;
+			if (directText(el) !== option) continue;
+			const r = el.getBoundingClientRect();
+			const area = r.width * r.height;
+			if (area <= 0) continue;
+			if (area < bestArea) {
+				bestArea = area;
+				best = { el, r };
+			}
+		}
+		if (!best) return JSON.stringify({ found: false });
+		return JSON.stringify({
+			found: true,
+			x: best.r.left + best.r.width / 2,
+			y: best.r.top + best.r.height / 2,
+			tag: best.el.tagName,
+			cls: best.el.className,
+			html: (best.el.outerHTML || '').slice(0, 200),
+		});
+	}`, groupLabel, optionText)
+
+	if err != nil {
+		return proto.Point{}, err
+	}
+	raw := ""
+	if res != nil {
+		raw = res.Value.Str()
+	}
+	if raw == "" {
+		return proto.Point{}, fmt.Errorf("eval returned empty for visible filter coords")
+	}
+	var info struct {
+		Found bool    `json:"found"`
+		X     float64 `json:"x"`
+		Y     float64 `json:"y"`
+		Tag   string  `json:"tag"`
+		Cls   string  `json:"cls"`
+		HTML  string  `json:"html"`
+	}
+	if err := json.Unmarshal([]byte(raw), &info); err != nil {
+		return proto.Point{}, fmt.Errorf("parse visible coords: %w (raw=%s)", err, raw)
+	}
+	if !info.Found {
+		return proto.Point{}, fmt.Errorf("no visible element with directText==%q in filter-related panels", optionText)
+	}
+	logrus.WithFields(logrus.Fields{
+		"group":  groupLabel,
+		"option": optionText,
+		"target": info.Tag + "." + info.Cls,
+		"html":   info.HTML,
+		"x":      info.X,
+		"y":      info.Y,
+	}).Info("found visible filter target via text match")
+	return proto.Point{X: info.X, Y: info.Y}, nil
+}
+
+// anyActiveOptionEquals 判断当前 DOM 里任何可见 .active/.selected 元素的
+// 文本是否等于 optionText。用于"自身没变 active 但其他可见元素变了"的场景
+// （典型：visible-coords-cdp 点的不是我们持有的 tag）。
+func anyActiveOptionEquals(page *rod.Page, optionText string) bool {
+	res, err := page.Eval(`(option) => {
+		const visible = el => {
+			const cs = window.getComputedStyle(el);
+			if (cs.display === 'none') return false;
+			if (cs.visibility === 'hidden') return false;
+			if (parseFloat(cs.opacity) < 0.5) return false;
+			if (el.getAttribute('aria-hidden') === 'true') return false;
+			return true;
+		};
+		const candidates = document.querySelectorAll(
+			'.active, .selected, [class*="active"], [class*="selected"]'
+		);
+		for (const el of candidates) {
+			if (!visible(el)) continue;
+			const t = (el.textContent || '').trim();
+			if (t === option) return true;
+		}
+		return false;
+	}`, optionText)
+	if err != nil || res == nil {
+		return false
+	}
+	return res.Value.Bool()
+}
+
+// waitForClassActive poll element 的 class 直到含 active/selected 或超时。
+func waitForClassActive(el *rod.Element, budget time.Duration) bool {
+	deadline := time.Now().Add(budget)
+	for {
+		if isClassActive(elementClass(el)) {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(classActivePollInterval)
+	}
+}
+
+// clickViaElementFromPoint 用 JS 在 tag 中心点拿 elementFromPoint，对那个
+// 实际最上层元素 dispatch 完整鼠标事件序列。是兜底策略；若 XHS 检查 isTrusted
+// 此路也会失效。
+func clickViaElementFromPoint(el *rod.Element) error {
+	_, err := el.Eval(`() => {
+		const r = this.getBoundingClientRect();
+		const x = r.left + r.width / 2;
+		const y = r.top + r.height / 2;
+		const target = document.elementFromPoint(x, y) || this;
+		const opts = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, button: 0 };
+		target.dispatchEvent(new MouseEvent('mousedown', opts));
+		target.dispatchEvent(new MouseEvent('mouseup', opts));
+		target.dispatchEvent(new MouseEvent('click', opts));
+		return true;
+	}`)
+	return err
+}
+
+// captureTagShape 拿 tag 的简要结构（outerHTML 截短 + 子元素列表）做 logs。
+func captureTagShape(el *rod.Element) logrus.Fields {
+	res, err := el.Eval(`() => {
+		const html = (this.outerHTML || '').slice(0, 200);
+		const children = Array.from(this.children || []).map(c => ({
+			tag: c.tagName,
+			cls: c.className,
+			text: (c.textContent || '').slice(0, 30),
+		}));
+		return JSON.stringify({ html, children });
+	}`)
+	if err != nil || res == nil {
+		return logrus.Fields{"shape_err": err}
+	}
+	return logrus.Fields{"tag_shape": res.Value.Str()}
+}
+
+// elementClass 读 element 的 class 属性；空值或读取失败都返回 ""。
+func elementClass(el *rod.Element) string {
+	cls, err := el.Attribute("class")
+	if err != nil || cls == nil {
+		return ""
+	}
+	return *cls
+}
+
+// isClassActive 判断 class 字符串里是否含有 active / selected 标记。
+// XHS 用 .active / .selected / 包含 "active" / 包含 "selected" 几种写法都见过。
+func isClassActive(class string) bool {
+	if class == "" {
+		return false
+	}
+	return strings.Contains(class, "active") || strings.Contains(class, "selected")
 }
 
 // clickInteractable 用三层策略点击筛选选项。
@@ -388,10 +781,18 @@ func logClickDiagnostics(el *rod.Element, groupLabel, optionText string) {
 }
 
 // waitForFilterApplied 在 filterApplyTimeout 内做条件竞争。
+//
+// 特别处理 stateEmpty：XHS 切换排序时会把 feeds 数组先清空（loading）再用
+// XHR 结果回填，第一次 poll 经常恰好踩在清空瞬间。看到 empty 不立刻返
+// ErrEmptyResult，而是给 filterEmptyStateGrace 让数据回填，超过这个 grace
+// 还是空才认定真的没结果。
 func waitForFilterApplied(ctx context.Context, page *rod.Page, initial searchSnapshot) error {
 	deadline := time.Now().Add(filterApplyTimeout)
 	ticker := time.NewTicker(filterPollInterval)
 	defer ticker.Stop()
+
+	var emptySince time.Time       // 第一次看到 stateEmpty 的时刻；feeds 回填时清零
+	var emptyDiagnosticDumped bool // 在 grace 期间只 dump 一次 feeds 结构
 
 	for {
 		// 登录弹窗：扫码登录组件出现
@@ -406,24 +807,55 @@ func waitForFilterApplied(ctx context.Context, page *rod.Page, initial searchSna
 		cur := captureSearchSnapshot(page)
 		switch cur.State {
 		case stateEmpty:
-			return errors.ErrEmptyResult
+			if emptySince.IsZero() {
+				emptySince = time.Now()
+				logrus.WithFields(logrus.Fields{
+					"grace":          filterEmptyStateGrace.String(),
+					"initial_fp":     initial.Fingerprint,
+					"current_active": cur.ActiveFilters,
+				}).Info("filter result currently empty; waiting for XHR to repopulate (grace)")
+			}
+			if !emptyDiagnosticDumped {
+				logFeedsStructure(page, "while empty (waiting for repopulate)")
+				emptyDiagnosticDumped = true
+			}
+			if time.Since(emptySince) > filterEmptyStateGrace {
+				// 真的空：grace 期间数据没回来
+				logrus.WithFields(logrus.Fields{
+					"empty_for": time.Since(emptySince).String(),
+				}).Warn("filter result remained empty beyond grace; returning empty_result")
+				return errors.ErrEmptyResult
+			}
+			// 还在 grace 内：继续 poll
 		case stateFeeds:
+			emptySince = time.Time{} // feeds 回填了，清零
 			if filterChanged(initial, cur) {
 				return nil
 			}
 		}
 
 		if time.Now().After(deadline) {
-			logrus.WithFields(logrus.Fields{
-				"initial_fp":      initial.Fingerprint,
-				"current_fp":      cur.Fingerprint,
-				"initial_url":     initial.URLSearch,
-				"current_url":     cur.URLSearch,
-				"initial_active":  initial.ActiveFilters,
-				"current_active":  cur.ActiveFilters,
-				"state":           cur.State,
-				"feeds_len_match": cur.Fingerprint != "" && cur.Fingerprint == initial.Fingerprint,
-			}).Warn("search filter apply timed out (no signal changed)")
+			fields := logrus.Fields{
+				"initial_fp":     initial.Fingerprint,
+				"current_fp":     cur.Fingerprint,
+				"initial_url":    initial.URLSearch,
+				"current_url":    cur.URLSearch,
+				"initial_active": initial.ActiveFilters,
+				"current_active": cur.ActiveFilters,
+				"state":          cur.State,
+			}
+			if activeFiltersOnlyChanged(initial, cur) {
+				// click 让 UI 选中状态变了，但 feed 列表 / URL 都没刷新。
+				// 通常是 JS dispatchEvent 的 isTrusted=false 被 XHS 真实搜索 XHR
+				// 过滤掉，只触发了纯前端 UI 更新。返回 timeout（而不是当成功）
+				// 是 issue #3 的核心修复点，避免静默返回旧的"综合"结果。
+				logrus.WithFields(fields).Warn(
+					"filter timeout: only UI active state changed, " +
+						"feed list / URL not refreshed (likely synthetic-event被忽略)",
+				)
+			} else {
+				logrus.WithFields(fields).Warn("search filter apply timed out (no signal changed)")
+			}
 			return errors.ErrFilterTimeout
 		}
 
@@ -435,13 +867,62 @@ func waitForFilterApplied(ctx context.Context, page *rod.Page, initial searchSna
 	}
 }
 
+// logFeedsStructure dump __INITIAL_STATE__.search.* 的结构（keys + 长度），
+// 帮助定位"feeds 不是空数组而是放到了别的字段下"这类情况。
+func logFeedsStructure(page *rod.Page, when string) {
+	res, err := page.Eval(`() => {
+		const out = { ok: true };
+		try {
+			if (!window.__INITIAL_STATE__) { out.has_state = false; return JSON.stringify(out); }
+			out.state_keys = Object.keys(window.__INITIAL_STATE__);
+			const search = window.__INITIAL_STATE__.search;
+			if (!search) { out.has_search = false; return JSON.stringify(out); }
+			out.search_keys = Object.keys(search);
+			if (search.feeds) {
+				const f = search.feeds;
+				out.feeds_keys = Object.keys(f);
+				out.feeds_value_isArray = Array.isArray(f.value);
+				out.feeds_value_len = Array.isArray(f.value) ? f.value.length : null;
+				out.feeds__value_isArray = Array.isArray(f._value);
+				out.feeds__value_len = Array.isArray(f._value) ? f._value.length : null;
+			}
+			// 也看下 DOM 上有几张可见 feed 卡片，作为另一个独立信号
+			const cards = document.querySelectorAll('section.note-item, [class*="note-item"], [data-note-id]');
+			out.dom_card_count = cards.length;
+		} catch (e) { out.err = String(e); }
+		return JSON.stringify(out);
+	}`)
+	if err != nil || res == nil {
+		logrus.WithError(err).Warn("logFeedsStructure eval failed")
+		return
+	}
+	logrus.WithFields(logrus.Fields{
+		"when": when,
+		"info": res.Value.Str(),
+	}).Warn("feeds structure diagnostic")
+}
+
 // pageHas 是 page.Has 的安全封装，错误吞掉视为不存在。
 func pageHas(page *rod.Page, selector string) bool {
 	has, _, _ := page.Has(selector)
 	return has
 }
 
-// filterChanged 用多信号 OR 判断筛选是否生效。任意一个维度变化都算。
+// filterChanged 判断筛选是否真的生效。
+//
+// **重要**：ActiveFilters（DOM 里 .active/.selected 的变化）单独不算成功信号。
+// XHS 的 click handler 会立刻把目标选项 mark 成 active（UI 状态），但是真正
+// 触发搜索 XHR / 改写 __INITIAL_STATE__.search.feeds 是更晚一点。如果只看
+// ActiveFilters 就返回，会在 feed 列表还没刷新前就退出，调用方拿到的还是
+// 旧的"综合"结果（issue #3）。
+//
+// 因此只接受能直接反映 feed 列表已经更新的信号：
+//  1. Fingerprint（feeds 全量 id 拼接）变化
+//  2. URLSearch（location.search）变化 —— XHS 部分版本会把 sort= 写进 query，
+//     这只有在搜索 XHR 完成后才会发生
+//
+// ActiveFilters 仅用于诊断（区分"click 没生效" vs "click 触发了 UI 但 feed
+// 还没刷新"）。
 func filterChanged(initial, cur searchSnapshot) bool {
 	if cur.Fingerprint != "" && cur.Fingerprint != initial.Fingerprint {
 		return true
@@ -449,10 +930,24 @@ func filterChanged(initial, cur searchSnapshot) bool {
 	if cur.URLSearch != "" && cur.URLSearch != initial.URLSearch {
 		return true
 	}
-	if cur.ActiveFilters != initial.ActiveFilters {
-		return true
-	}
 	return false
+}
+
+// activeFiltersOnlyChanged 用于诊断：UI 选中状态变了，但 feed 列表 / URL
+// 都没变。命中这种情况说明 click 触发了 UI handler 但没触发实际的搜索请求
+// （例如 JS dispatchEvent 的 isTrusted=false 被 XHS 滤掉），需要 timeout
+// 而不是当成功。
+func activeFiltersOnlyChanged(initial, cur searchSnapshot) bool {
+	if cur.ActiveFilters == initial.ActiveFilters {
+		return false
+	}
+	if cur.Fingerprint != "" && cur.Fingerprint != initial.Fingerprint {
+		return false
+	}
+	if cur.URLSearch != "" && cur.URLSearch != initial.URLSearch {
+		return false
+	}
+	return true
 }
 
 // extractFeedsFromPage 读取 __INITIAL_STATE__ 中的 feeds 列表。

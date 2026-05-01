@@ -872,13 +872,16 @@ npx mcporter list xiaohongshu-mcp
     - `search_scope`: 搜索范围 - `不限`（默认）| `已看过` | `未看过` | `已关注`
     - `location`: 位置距离 - `不限`（默认）| `同城` | `附近`
   - 筛选行为说明：当传入 `filters` 时，会通过原生筛选 UI 操作。点击筛选选项后会进入条件竞争，命中以下任一条件就立即结束（最长 25 秒）：
-    - feed 列表指纹变化 → 成功，返回筛选后的 feeds
+    - feed 列表指纹（全量 id 拼接）变化 → 成功，返回筛选后的 feeds
+    - URL query（`location.search`）变化 → 成功（XHS 部分版本会把 `sort=` 写进 query）
     - 出现登录弹窗 → 返回 `login_required`
     - 出现安全验证 / 验证码 → 返回 `captcha_or_security_check`
     - feed 列表为空 → 返回 `empty_result`
     - 找不到筛选按钮 / 面板 / 选项 → 返回 `selector_not_found`
     - 找到选项但点击失败（不可交互 / 面板收起 / 渲染中等） → 返回 `filter_click_failed`
-    - 25 秒内 feed 未变化 → 返回 `filter_timeout`
+    - 25 秒内 feed 列表 / URL 都未变 → 返回 `filter_timeout`
+
+    **注意**：UI 选中状态（`.active` / `.selected` 标签变化）单独不算成功信号 —— 点击 handler 会立刻 mark 选项为 active，但实际搜索 XHR 是更晚才发的。如果只看 UI 选中，会在 feed 还没刷新前就退出，调用方拿到旧的 "综合" 结果。当出现 "UI 选中变了但 feed 没变" 时，logs 里会打印 `filter timeout: only UI active state changed, feed list / URL not refreshed` 帮助定位（issue #3）。
 
     错误信息走 `errors` 包里的 sentinel，可用 `errors.Is(err, errors.ErrFilterTimeout)` 等判断。
 
